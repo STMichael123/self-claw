@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Self-Claw 管理看板</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <aside class="sidebar">
+        <div class="logo">
+            <h1>Self-Claw</h1>
+            <span class="version">v0.6.0</span>
+        </div>
+        <nav>
+            <a href="#" class="nav-item active" data-view="dashboard">
+                <span class="icon">📊</span> 总览
+            </a>
+            <a href="#" class="nav-item" data-view="chat">
+                <span class="icon">💬</span> Agent 对话
+            </a>
+            <a href="#" class="nav-item" data-view="skills">
+                <span class="icon">📋</span> Skill 管理
+            </a>
+            <a href="#" class="nav-item" data-view="tasks">
+                <span class="icon">⏱️</span> 任务调度
+            </a>
+            <a href="#" class="nav-item" data-view="sessions">
+                <span class="icon">🗂️</span> 会话管理
+            </a>
+            <a href="#" class="nav-item" data-view="tools">
+                <span class="icon">🔧</span> 工具列表
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <span class="status-dot" id="health-dot"></span>
+            <span id="health-text">检查中...</span>
+        </div>
+    </aside>
+
+    <main class="content">
+        <!-- ── 总览 ── -->
+        <section id="view-dashboard" class="view active">
+            <h2>总览</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">活跃任务</div>
+                    <div class="stat-value" id="stat-tasks">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">活跃会话</div>
+                    <div class="stat-value" id="stat-sessions">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">已注册 Skill</div>
+                    <div class="stat-value" id="stat-skills">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">已注册工具</div>
+                    <div class="stat-value" id="stat-tools">0</div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>今日成本</h3>
+                <div class="cost-summary" id="cost-summary">
+                    <div class="cost-item">
+                        <span>输入 Token</span>
+                        <strong id="cost-input">0</strong>
+                    </div>
+                    <div class="cost-item">
+                        <span>输出 Token</span>
+                        <strong id="cost-output">0</strong>
+                    </div>
+                    <div class="cost-item">
+                        <span>预估费用</span>
+                        <strong id="cost-total">$0.00</strong>
+                    </div>
+                    <div class="cost-item">
+                        <span>调用次数</span>
+                        <strong id="cost-calls">0</strong>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>最近会话</h3>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>会话 ID</th>
+                            <th>用户</th>
+                            <th>渠道</th>
+                            <th>状态</th>
+                            <th>最后活跃</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recent-sessions">
+                        <tr><td colspan="5" class="empty">暂无数据</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- ── Agent 对话 ── -->
+        <section id="view-chat" class="view">
+            <h2>Agent 对话</h2>
+            <div class="chat-container">
+                <div class="chat-messages" id="chat-messages">
+                    <div class="msg system">欢迎使用 Self-Claw Agent，请输入你的问题。</div>
+                </div>
+                <div class="chat-input-area">
+                    <textarea id="chat-input" placeholder="输入消息..." rows="2"></textarea>
+                    <button id="chat-send" class="btn btn-primary">发送</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Skill 管理 ── -->
+        <section id="view-skills" class="view">
+            <h2>Skill 管理</h2>
+            <div class="toolbar">
+                <button class="btn btn-primary" id="btn-new-skill">+ 新建 Skill</button>
+                <select id="skill-filter">
+                    <option value="">全部状态</option>
+                    <option value="enabled">启用</option>
+                    <option value="disabled">停用</option>
+                </select>
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>名称</th>
+                        <th>版本</th>
+                        <th>状态</th>
+                        <th>创建时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="skills-list">
+                    <tr><td colspan="5" class="empty">暂无 Skill</td></tr>
+                </tbody>
+            </table>
+
+            <!-- 新建 Skill 弹窗 -->
+            <div class="modal" id="modal-skill" style="display:none">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3>新建 Skill</h3>
+                        <button class="modal-close" data-close="modal-skill">&times;</button>
+                    </div>
+                    <form id="form-skill">
+                        <label>名称 <input type="text" name="name" required></label>
+                        <label>显示名 <input type="text" name="display_name"></label>
+                        <label>适用场景 <input type="text" name="scenario"></label>
+                        <label>指令内容 <textarea name="content" rows="5"></textarea></label>
+                        <div class="modal-actions">
+                            <button type="button" class="btn" data-close="modal-skill">取消</button>
+                            <button type="submit" class="btn btn-primary">创建</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── 任务调度 ── -->
+        <section id="view-tasks" class="view">
+            <h2>任务调度</h2>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>任务名</th>
+                        <th>调度类型</th>
+                        <th>表达式</th>
+                        <th>状态</th>
+                        <th>下次执行</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="tasks-list">
+                    <tr><td colspan="6" class="empty">暂无定时任务</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- ── 会话管理 ── -->
+        <section id="view-sessions" class="view">
+            <h2>会话管理</h2>
+            <div class="toolbar">
+                <select id="session-filter">
+                    <option value="">全部状态</option>
+                    <option value="active">活跃</option>
+                    <option value="expired">已过期</option>
+                    <option value="archived">已归档</option>
+                </select>
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>会话 ID</th>
+                        <th>用户</th>
+                        <th>渠道</th>
+                        <th>状态</th>
+                        <th>创建时间</th>
+                        <th>最后活跃</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="sessions-list">
+                    <tr><td colspan="7" class="empty">暂无会话</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- ── 工具列表 ── -->
+        <section id="view-tools" class="view">
+            <h2>已注册工具</h2>
+            <div class="cards-grid" id="tools-list">
+                <div class="empty-card">暂无已注册工具</div>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
