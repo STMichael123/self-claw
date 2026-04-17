@@ -41,6 +41,8 @@ class ChannelAdapter(ABC):
 class TestChannelAdapter(ChannelAdapter):
     """内存实现的测试渠道适配器，用于开发、测试与演示。"""
 
+    __test__ = False
+
     def __init__(self) -> None:
         self.sent_messages: list[OutboundMessage] = []
         self.users: dict[str, UserIdentity] = {}

@@ -34,7 +34,7 @@ class SchedulerService:
 
     def add_task(
         self,
-        task_id: str,
+        job_id: str,
         func: Callable[..., Awaitable[Any]],
         *,
         schedule_type: str,
@@ -46,11 +46,15 @@ class SchedulerService:
         self._scheduler.add_job(
             func,
             trigger=trigger,
-            id=task_id,
+            id=job_id,
             replace_existing=True,
             kwargs=kwargs,
         )
-        logger.info("task_added", task_id=task_id, schedule_type=schedule_type, schedule_expr=schedule_expr)
+        logger.info("task_added", task_id=job_id, schedule_type=schedule_type, schedule_expr=schedule_expr)
+
+    def validate_schedule(self, *, schedule_type: str, schedule_expr: str) -> None:
+        """校验调度表达式是否合法。"""
+        self._build_trigger(schedule_type, schedule_expr)
 
     def pause_task(self, task_id: str) -> None:
         self._scheduler.pause_job(task_id)
@@ -63,6 +67,15 @@ class SchedulerService:
     def remove_task(self, task_id: str) -> None:
         self._scheduler.remove_job(task_id)
         logger.info("task_removed", task_id=task_id)
+
+    def get_task(self, task_id: str) -> Any | None:
+        return self._scheduler.get_job(task_id)
+
+    def get_next_run_at(self, task_id: str) -> str | None:
+        job = self.get_task(task_id)
+        if job is None or job.next_run_time is None:
+            return None
+        return job.next_run_time.isoformat()
 
     @staticmethod
     def _build_trigger(schedule_type: str, schedule_expr: str) -> Any:

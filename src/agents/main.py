@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import structlog
 
@@ -38,15 +38,24 @@ class MainAgent:
         user_message: str,
         *,
         history: list[ChatMessage] | None = None,
-        skill_prompt: str | None = None,
+        available_skills_catalog: list[dict[str, Any]] | None = None,
+        activated_skills: list[dict[str, Any]] | None = None,
         memory_context: str = "",
         run_id: str | None = None,
+        cancellation_checker: Callable[[], bool] | None = None,
+        cancellation_waiter: Callable[[], Awaitable[None]] | None = None,
+        approval_requester: Callable[[str, dict[str, Any], Any], Awaitable[dict[str, Any]]] | None = None,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        resume_state: dict[str, Any] | None = None,
+        approved_approval: dict[str, Any] | None = None,
+        runtime_context: dict[str, Any] | None = None,
     ) -> AgentResult:
         """处理用户消息并返回结果。"""
         run_id = run_id or str(uuid.uuid4())
 
         system_prompt = compose_system_prompt(
-            skill_prompt=skill_prompt,
+            available_skills_catalog=available_skills_catalog,
+            activated_skills=activated_skills,
             memory_context=memory_context,
         )
 
@@ -61,10 +70,17 @@ class MainAgent:
             tools=self.tools,
             tool_executor=self.tool_executor,
             max_steps=self.max_steps,
+            cancellation_checker=cancellation_checker,
+            cancellation_waiter=cancellation_waiter,
+            approval_requester=approval_requester,
         )
 
         return await loop.run(
             system_prompt=system_prompt,
             messages=messages,
             run_id=run_id,
+            event_callback=event_callback,
+            resume_state=resume_state,
+            approved_approval=approved_approval,
+            runtime_context=runtime_context,
         )

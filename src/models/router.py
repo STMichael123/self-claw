@@ -6,6 +6,7 @@ import os
 
 import tiktoken
 
+from src.models.dev_adapter import DevLLMAdapter
 from src.models.llm import AnthropicAdapter, LLMAdapter, OpenAIAdapter
 
 
@@ -56,5 +57,9 @@ class ModelRouter:
     @staticmethod
     def _create(provider: str, model: str) -> LLMAdapter:
         if provider == "anthropic":
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                return DevLLMAdapter()
             return AnthropicAdapter(model=model)
+        if not os.environ.get("OPENAI_API_KEY"):
+            return DevLLMAdapter()
         return OpenAIAdapter(model=model)

@@ -3,159 +3,191 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Self-Claw 管理看板</title>
+    <title>Self-Claw 控制台</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
     <aside class="sidebar">
-        <div class="logo">
-            <h1>Self-Claw</h1>
-            <span class="version">v0.6.0</span>
+        <div class="logo-block">
+            <h1>SELF-CLAW</h1>
+            <span class="version">v1.0.1</span>
         </div>
-        <nav>
-            <a href="#" class="nav-item active" data-view="dashboard">
-                <span class="icon">📊</span> 总览
-            </a>
-            <a href="#" class="nav-item" data-view="chat">
-                <span class="icon">💬</span> Agent 对话
-            </a>
-            <a href="#" class="nav-item" data-view="skills">
-                <span class="icon">📋</span> Skill 管理
-            </a>
-            <a href="#" class="nav-item" data-view="tasks">
-                <span class="icon">⏱️</span> 任务调度
-            </a>
-            <a href="#" class="nav-item" data-view="sessions">
-                <span class="icon">🗂️</span> 会话管理
-            </a>
-            <a href="#" class="nav-item" data-view="tools">
-                <span class="icon">🔧</span> 工具列表
-            </a>
+
+        <nav class="nav-list">
+            <a href="#" class="nav-item active" data-view="entry">会话入口</a>
+            <a href="#" class="nav-item" data-view="status">状态监控</a>
+            <a href="#" class="nav-item nav-chat hidden" data-view="chat">当前会话</a>
+            <a href="#" class="nav-item" data-view="skills">Skill 目录</a>
+            <a href="#" class="nav-item" data-view="tasks">任务调度</a>
+            <a href="#" class="nav-item" data-view="tools">工具列表</a>
         </nav>
-        <div class="sidebar-footer">
-            <span class="status-dot" id="health-dot"></span>
-            <span id="health-text">检查中...</span>
+
+        <div class="sidebar-panel">
+            <div class="health-row">
+                <span class="status-dot" id="health-dot"></span>
+                <span id="health-text">检查中...</span>
+            </div>
+            <div class="selected-session" id="selected-session-text">当前未进入任何会话</div>
         </div>
     </aside>
 
-    <main class="content">
-        <!-- ── 总览 ── -->
-        <section id="view-dashboard" class="view active">
-            <h2>总览</h2>
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-label">活跃任务</div>
-                    <div class="stat-value" id="stat-tasks">0</div>
+    <main class="content-shell">
+        <section id="view-entry" class="view active">
+            <header class="page-header">
+                <div>
+                    <h2>会话入口</h2>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">活跃会话</div>
-                    <div class="stat-value" id="stat-sessions">0</div>
+                <div class="summary-strip" id="entry-summary"></div>
+            </header>
+
+            <div class="bubble-grid" id="session-bubbles">
+                <div class="empty-state">正在加载会话入口...</div>
+            </div>
+        </section>
+
+        <section id="view-chat" class="view">
+            <header class="page-header compact">
+                <div>
+                    <h2 id="chat-title">当前会话</h2>
+                    <p class="page-desc" id="chat-meta">尚未选择会话。</p>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">已注册 Skill</div>
-                    <div class="stat-value" id="stat-skills">0</div>
+                <div class="header-actions">
+                    <button class="btn btn-secondary" id="btn-close-session">删除当前会话</button>
+                    <button class="btn btn-secondary" id="btn-back-entry">返回会话入口</button>
+                    <button class="btn btn-secondary" id="btn-refresh-chat">刷新</button>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">已注册工具</div>
-                    <div class="stat-value" id="stat-tools">0</div>
+            </header>
+
+            <div class="chat-layout compact">
+                <div class="chat-panel chat-panel-compact">
+                    <div class="summary-strip chat-summary" id="chat-summary"></div>
+                    <div class="chat-messages" id="chat-messages">
+                        <div class="msg system">请先选择一个会话。</div>
+                    </div>
+
+                    <div class="chat-controls compact">
+                        <select id="task-mode" class="hidden">
+                            <option value="continue">继续当前会话</option>
+                            <option value="new_task">新建会话</option>
+                            <option value="cancel_and_rerun">重新执行当前会话</option>
+                        </select>
+                        <select id="chat-skill" class="hidden">
+                            <option value="">默认</option>
+                        </select>
+                        <div class="chat-compose-row">
+                            <textarea id="chat-input" rows="2" placeholder="对话框"></textarea>
+                            <button class="btn btn-primary composer-send" id="chat-send">发送</button>
+                        </div>
+                    </div>
                 </div>
             </div>
+        </section>
 
-            <div class="panel">
-                <h3>今日成本</h3>
-                <div class="cost-summary" id="cost-summary">
-                    <div class="cost-item">
-                        <span>输入 Token</span>
-                        <strong id="cost-input">0</strong>
+        <section id="view-status" class="view">
+            <header class="page-header">
+                <div>
+                    <h2>状态监控</h2>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-secondary" id="btn-refresh-status">刷新状态</button>
+                </div>
+            </header>
+
+            <div class="status-layout">
+                <div class="status-column">
+                    <div class="panel-card">
+                        <h3>会话列表</h3>
+                        <div id="status-overview-list" class="stack-list">
+                            <div class="empty-state">暂无状态数据</div>
+                        </div>
                     </div>
-                    <div class="cost-item">
-                        <span>输出 Token</span>
-                        <strong id="cost-output">0</strong>
-                    </div>
-                    <div class="cost-item">
-                        <span>预估费用</span>
-                        <strong id="cost-total">$0.00</strong>
-                    </div>
-                    <div class="cost-item">
-                        <span>调用次数</span>
-                        <strong id="cost-calls">0</strong>
+                </div>
+
+                <div class="status-column wide">
+                    <div class="panel-card">
+                        <h3>详情</h3>
+                        <div id="status-run-tree" class="run-tree">
+                            <div class="empty-state">选择左侧会话后查看详情。</div>
+                        </div>
                     </div>
                 </div>
             </div>
+        </section>
 
-            <div class="panel">
-                <h3>最近会话</h3>
+        <section id="view-skills" class="view">
+            <header class="page-header compact">
+                <div>
+                    <h2>Skill 目录</h2>
+                </div>
+                <div class="header-actions">
+                    <label class="search-field">
+                        <input type="search" id="skill-search" placeholder="按名称或描述过滤 Skill">
+                    </label>
+                    <select id="skill-filter">
+                        <option value="">全部状态</option>
+                        <option value="enabled">启用</option>
+                        <option value="disabled">停用</option>
+                    </select>
+                    <button class="btn btn-secondary" id="btn-refresh-skills">刷新目录</button>
+                    <button class="btn btn-primary" id="btn-new-skill">新建</button>
+                </div>
+            </header>
+
+            <div class="summary-strip" id="skills-summary"></div>
+
+            <div class="panel-card">
                 <table class="data-table">
                     <thead>
                         <tr>
-                            <th>会话 ID</th>
-                            <th>用户</th>
-                            <th>渠道</th>
+                            <th>名称</th>
                             <th>状态</th>
-                            <th>最后活跃</th>
+                            <th>来源</th>
+                            <th>最新修订</th>
+                            <th>最近索引</th>
+                            <th>操作</th>
                         </tr>
                     </thead>
-                    <tbody id="recent-sessions">
-                        <tr><td colspan="5" class="empty">暂无数据</td></tr>
+                    <tbody id="skills-list">
+                        <tr><td colspan="6" class="empty">暂无 Skill</td></tr>
                     </tbody>
                 </table>
             </div>
-        </section>
 
-        <!-- ── Agent 对话 ── -->
-        <section id="view-chat" class="view">
-            <h2>Agent 对话</h2>
-            <div class="chat-container">
-                <div class="chat-messages" id="chat-messages">
-                    <div class="msg system">欢迎使用 Self-Claw Agent，请输入你的问题。</div>
+            <div class="panel-card spaced">
+                <div class="panel-header-inline">
+                    <h3>待处理</h3>
+                    <span class="table-muted">待发布</span>
                 </div>
-                <div class="chat-input-area">
-                    <textarea id="chat-input" placeholder="输入消息..." rows="2"></textarea>
-                    <button id="chat-send" class="btn btn-primary">发送</button>
+                <div id="skill-drafts-list" class="stack-list">
+                    <div class="empty-state">暂无待审核草稿</div>
                 </div>
             </div>
-        </section>
 
-        <!-- ── Skill 管理 ── -->
-        <section id="view-skills" class="view">
-            <h2>Skill 管理</h2>
-            <div class="toolbar">
-                <button class="btn btn-primary" id="btn-new-skill">+ 新建 Skill</button>
-                <select id="skill-filter">
-                    <option value="">全部状态</option>
-                    <option value="enabled">启用</option>
-                    <option value="disabled">停用</option>
-                </select>
-            </div>
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>名称</th>
-                        <th>版本</th>
-                        <th>状态</th>
-                        <th>创建时间</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-                <tbody id="skills-list">
-                    <tr><td colspan="5" class="empty">暂无 Skill</td></tr>
-                </tbody>
-            </table>
-
-            <!-- 新建 Skill 弹窗 -->
-            <div class="modal" id="modal-skill" style="display:none">
+            <div class="modal hidden" id="modal-skill">
                 <div class="modal-content">
                     <div class="modal-header">
                         <h3>新建 Skill</h3>
-                        <button class="modal-close" data-close="modal-skill">&times;</button>
+                        <button class="modal-close" data-close="modal-skill">关闭</button>
                     </div>
-                    <form id="form-skill">
-                        <label>名称 <input type="text" name="name" required></label>
-                        <label>显示名 <input type="text" name="display_name"></label>
-                        <label>适用场景 <input type="text" name="scenario"></label>
-                        <label>指令内容 <textarea name="content" rows="5"></textarea></label>
-                        <div class="modal-actions">
-                            <button type="button" class="btn" data-close="modal-skill">取消</button>
+                    <form id="form-skill" class="form-grid">
+                        <label class="field-label">
+                            <span>名称</span>
+                            <input type="text" name="name" required>
+                        </label>
+                        <label class="field-label">
+                            <span>描述</span>
+                            <input type="text" name="description" required>
+                        </label>
+                        <label class="field-label full">
+                            <span>允许工具（逗号分隔）</span>
+                            <input type="text" name="allowed_tools" placeholder="例如：web_fetch, read_file">
+                        </label>
+                        <label class="field-label full">
+                            <span>SKILL.md 正文</span>
+                            <textarea name="content" rows="6"></textarea>
+                        </label>
+                        <div class="modal-actions full">
+                            <button type="button" class="btn btn-secondary" data-close="modal-skill">取消</button>
                             <button type="submit" class="btn btn-primary">创建</button>
                         </div>
                     </form>
@@ -163,63 +195,111 @@
             </div>
         </section>
 
-        <!-- ── 任务调度 ── -->
         <section id="view-tasks" class="view">
-            <h2>任务调度</h2>
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>任务名</th>
-                        <th>调度类型</th>
-                        <th>表达式</th>
-                        <th>状态</th>
-                        <th>下次执行</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-                <tbody id="tasks-list">
-                    <tr><td colspan="6" class="empty">暂无定时任务</td></tr>
-                </tbody>
-            </table>
-        </section>
+            <header class="page-header compact">
+                <div>
+                    <h2>任务调度</h2>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-secondary" id="btn-refresh-tasks">刷新任务</button>
+                </div>
+            </header>
 
-        <!-- ── 会话管理 ── -->
-        <section id="view-sessions" class="view">
-            <h2>会话管理</h2>
-            <div class="toolbar">
-                <select id="session-filter">
-                    <option value="">全部状态</option>
-                    <option value="active">活跃</option>
-                    <option value="expired">已过期</option>
-                    <option value="archived">已归档</option>
-                </select>
+            <div class="summary-strip" id="tasks-summary"></div>
+
+            <div class="status-layout">
+                <div class="status-column">
+                    <div class="panel-card">
+                        <h3>新建任务</h3>
+                        <form id="form-task" class="form-grid">
+                            <label class="field-label full">
+                                <span>任务标题</span>
+                                <input type="text" name="title" required placeholder="例如：每天同步竞品信息">
+                            </label>
+                            <label class="field-label full">
+                                <span>执行内容</span>
+                                <textarea name="prompt" rows="5" required placeholder="输入要交给 Agent 执行的任务说明"></textarea>
+                            </label>
+                            <label class="field-label">
+                                <span>调度描述</span>
+                                <input type="text" name="schedule_text" required placeholder="例如：10分钟后 / 每30分钟执行一次 / 每天 09:30">
+                            </label>
+                            <label class="field-label">
+                                <span>Skill</span>
+                                <select id="task-skill" name="requested_skill_name">
+                                    <option value="">默认</option>
+                                </select>
+                            </label>
+                            <div class="modal-actions full">
+                                <button type="submit" class="btn btn-primary">创建任务</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <div class="status-column wide">
+                    <div class="panel-card">
+                        <h3>任务列表</h3>
+                        <div id="tasks-list" class="stack-list">
+                            <div class="empty-state">暂无任务</div>
+                        </div>
+                    </div>
+                </div>
             </div>
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>会话 ID</th>
-                        <th>用户</th>
-                        <th>渠道</th>
-                        <th>状态</th>
-                        <th>创建时间</th>
-                        <th>最后活跃</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-                <tbody id="sessions-list">
-                    <tr><td colspan="7" class="empty">暂无会话</td></tr>
-                </tbody>
-            </table>
         </section>
 
-        <!-- ── 工具列表 ── -->
         <section id="view-tools" class="view">
-            <h2>已注册工具</h2>
-            <div class="cards-grid" id="tools-list">
-                <div class="empty-card">暂无已注册工具</div>
+            <header class="page-header compact">
+                <div>
+                    <h2>工具列表</h2>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-secondary" id="btn-refresh-tools">刷新</button>
+                </div>
+            </header>
+
+            <div class="summary-strip" id="tools-summary"></div>
+
+            <div class="status-layout tools-layout">
+                <div class="status-column">
+                    <div class="panel-card">
+                        <h3>待审批调用</h3>
+                        <div class="stack-list" id="tool-approvals">
+                            <div class="empty-state">暂无待审批调用</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="status-column wide">
+                    <div class="tool-grid" id="tools-list">
+                        <div class="empty-state">暂无已注册工具</div>
+                    </div>
+                </div>
             </div>
         </section>
     </main>
+
+    <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
+
+    <div class="modal hidden" id="modal-session">
+        <div class="modal-content compact-modal">
+            <div class="modal-header">
+                <h3 id="session-modal-title">新建会话</h3>
+                <button class="modal-close" id="btn-session-close" type="button">关闭</button>
+            </div>
+            <form id="form-session" class="form-grid single-column">
+                <p class="modal-copy full" id="session-modal-hint">输入名称，可留空。</p>
+                <label class="field-label full">
+                    <span>会话名称</span>
+                    <input type="text" id="session-title-input" name="title" placeholder="例如：Agent 1">
+                </label>
+                <div class="modal-actions full">
+                    <button type="button" class="btn btn-secondary" id="btn-session-cancel">取消</button>
+                    <button type="submit" class="btn btn-primary" id="btn-session-submit">继续</button>
+                </div>
+            </form>
+        </div>
+    </div>
 
     <script src="/static/app.js"></script>
 </body>

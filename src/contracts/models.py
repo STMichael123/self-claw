@@ -50,11 +50,14 @@ class SkillStatus(StrEnum):
 
 
 class MemoryScope(StrEnum):
+    PRINCIPLE = "principle"
     SHORT_TERM = "short_term"
     LONG_TERM = "long_term"
 
 
 class VectorSourceType(StrEnum):
+    PRINCIPLE_MEMORY = "principle_memory"
+    SESSION_MESSAGE = "session_message"
     SESSION_SUMMARY = "session_summary"
     TASK_RESULT = "task_result"
     SKILL_OUTPUT = "skill_output"

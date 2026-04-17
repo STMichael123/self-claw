@@ -28,6 +28,7 @@ class CostService:
         output_tokens: int = 0,
         estimated_cost: float = 0.0,
         model_name: str = "",
+        commit: bool = True,
     ) -> str:
         """记录一次模型调用的用量。"""
         log_id = str(uuid.uuid4())
@@ -38,7 +39,8 @@ class CostService:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (log_id, task_id, session_id, agent_run_id, input_tokens, output_tokens, estimated_cost, model_name, now),
         )
-        self._db.commit()
+        if commit:
+            self._db.commit()
         return log_id
 
     def get_daily_summary(self, date: str | None = None) -> dict[str, Any]:

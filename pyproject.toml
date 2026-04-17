@@ -1,6 +1,6 @@
 [project]
 name = "self-claw"
-version = "0.6.0"
+version = "1.0.1"
 description = "轻量级企业 Agent 框架"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
     "openai>=1.30,<2",
     "anthropic>=0.30,<1",
     "chromadb>=0.5,<1",
+    "jsonschema>=4.23,<5",
     "python-dotenv>=1.0,<2",
     "structlog>=24.1,<26",
     "tiktoken>=0.7,<1",

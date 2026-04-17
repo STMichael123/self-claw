@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import structlog
 
@@ -29,7 +29,17 @@ class SubAgentExecutor:
         self.llm = llm
         self.tool_executor = tool_executor
 
-    async def run(self, request: SubAgentRequest) -> SubAgentResponse:
+    async def run(
+        self,
+        request: SubAgentRequest,
+        *,
+        cancellation_checker: Callable[[], bool] | None = None,
+        cancellation_waiter: Callable[[], Awaitable[None]] | None = None,
+        approval_requester: Callable[[str, dict[str, Any], Any], Awaitable[dict[str, Any]]] | None = None,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        resume_state: dict[str, Any] | None = None,
+        approved_approval: dict[str, Any] | None = None,
+    ) -> SubAgentResponse:
         """执行子 Agent 任务，返回结构化结果。"""
         log = logger.bind(run_id=request.run_id, parent_run_id=request.parent_run_id)
         log.info("sub_agent_start", role=request.sub_agent_role, goal=request.goal)
@@ -43,6 +53,9 @@ class SubAgentExecutor:
             self.llm,
             tool_executor=self.tool_executor,
             max_steps=10,
+            cancellation_checker=cancellation_checker,
+            cancellation_waiter=cancellation_waiter,
+            approval_requester=approval_requester,
         )
 
         try:
@@ -50,6 +63,9 @@ class SubAgentExecutor:
                 system_prompt=system_prompt,
                 messages=[ChatMessage(role="user", content=request.goal)],
                 run_id=request.run_id,
+                event_callback=event_callback,
+                resume_state=resume_state,
+                approved_approval=approved_approval,
             )
         except Exception as exc:
             log.error("sub_agent_failed", error=str(exc))
