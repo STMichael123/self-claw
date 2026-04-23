@@ -28,11 +28,11 @@ class TestDatabase:
         names = {r["name"] for r in tables}
         assert "tasks" in names
         assert "sessions" in names
-        assert "skills" in names
+        assert "skills" not in names
+        assert "skill_drafts" not in names
+        assert "skill_revisions" not in names
+        assert "skill_catalog_entries" in names
         assert "memory_documents" in names
-        assert "vector_records" in names
-        assert "skill_drafts" in names
-        assert "tool_calls" in names
         assert "tool_approvals" in names
         assert "file_locks" in names
         assert "file_operations" in names

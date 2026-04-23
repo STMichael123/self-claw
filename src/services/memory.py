@@ -1,4 +1,12 @@
-"""混合记忆服务（文件 + 向量） — 对应 SPEC FR-005。"""
+"""混合记忆服务（文件真相源 + DB 索引 + 向量） — 对应 SPEC FR-005。
+
+文件真相源：
+- Principle: .agents/principle.md
+- Long-term: .agents/memory/long-term/*.md
+- Short-term: data/memory/short_term/<date>/<session_id>.md
+
+数据库 MemoryDocument / MemoryIndex 仅承担索引与缓存职责。
+"""
 
 from __future__ import annotations
 
@@ -18,45 +26,165 @@ FORMAT_SUFFIX = {"markdown": ".md", "json": ".json"}
 
 
 class MemoryService:
-    """文件型 + 向量型混合记忆。"""
+    """文件型真相源 + DB 索引 + 向量检索混合记忆。"""
 
     def __init__(
         self,
         *,
         data_dir: str = "data/memory",
+        principle_file: str = ".agents/principle.md",
+        long_term_dir: str = ".agents/memory/long-term",
         db: sqlite3.Connection | None = None,
-        vector_store: Any | None = None,  # ChromaDB collection（可选）
+        vector_store: Any | None = None,
     ) -> None:
         self._data_dir = Path(data_dir)
         self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._principle_file = Path(principle_file)
+        self._long_term_dir = Path(long_term_dir)
         self._db = db
         self._vector_store = vector_store
-        for scope in MEMORY_SCOPES:
-            (self._data_dir / scope).mkdir(parents=True, exist_ok=True)
+        (self._data_dir / "short_term").mkdir(parents=True, exist_ok=True)
 
-    # ── 文件型记忆 ──────────────────────────────────────
+    # ── Principle（真相源：.agents/principle.md）────────────
+
+    def load_principle(self) -> str:
+        """从文件读取 Principle 内容。"""
+        if not self._principle_file.exists():
+            return ""
+        return self._principle_file.read_text(encoding="utf-8")
 
     def save_principle(
+        self,
+        content: str,
+        *,
+        operator: str = "system",
+        change_note: str = "",
+    ) -> Path:
+        """写入 Principle 文件 + 重建索引 + 审计日志。"""
+        self._principle_file.parent.mkdir(parents=True, exist_ok=True)
+        self._principle_file.write_text(content, encoding="utf-8")
+        self._upsert_memory_index(
+            scope="principle",
+            session_id=None,
+            ref_path=self._principle_file,
+            summary=self._build_summary(content),
+        )
+        self._index_document_vector(tier="principle", key="principle", content=content)
+        self._write_audit_log(
+            operator=operator,
+            action="update_principle",
+            entity_type="principle",
+            entity_id="principle",
+            diff_summary=change_note or "Principle updated",
+        )
+        logger.info("principle_saved", path=str(self._principle_file))
+        return self._principle_file
+
+    def sync_principle_index(self) -> bool:
+        """检测文件与 DB 索引一致性，不一致则重建。"""
+        if not self._principle_file.exists():
+            return False
+        content = self._principle_file.read_text(encoding="utf-8")
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        row = self._get_memory_index(scope="principle", ref_path=str(self._principle_file))
+        if row and row.get("summary") == self._build_summary(content):
+            return False
+        self._upsert_memory_index(
+            scope="principle",
+            session_id=None,
+            ref_path=self._principle_file,
+            summary=self._build_summary(content),
+        )
+        self._index_document_vector(tier="principle", key="principle", content=content)
+        logger.info("principle_index_synced")
+        return True
+
+    # ── Long-term（真相源：.agents/memory/long-term/*.md）────
+
+    def load_long_term(self, key: str) -> str:
+        """从文件读取指定 long-term 条目。"""
+        file_path = self._long_term_dir / f"{key}.md"
+        if not file_path.exists():
+            return ""
+        return file_path.read_text(encoding="utf-8")
+
+    def list_long_term(self) -> list[dict[str, Any]]:
+        """列出所有 long-term 条目（来自文件列表）。"""
+        if not self._long_term_dir.exists():
+            return []
+        entries: list[dict[str, Any]] = []
+        for fp in sorted(self._long_term_dir.glob("*.md")):
+            try:
+                text = fp.read_text(encoding="utf-8", errors="replace")
+                mtime = fp.stat().st_mtime
+            except OSError:
+                continue
+            entries.append({
+                "key": fp.stem,
+                "title": self._extract_title(text),
+                "snippet": self._build_summary(text),
+                "path": str(fp),
+                "mtime": mtime,
+            })
+        return entries
+
+    def save_long_term(
         self,
         key: str,
         content: str,
         *,
         title: str = "",
-        format: str = "markdown",
-        source_type: str = "manual",
-        source_ref: str | None = None,
+        operator: str = "system",
+        change_note: str = "",
     ) -> Path:
-        """保存全局 Principle 记忆。"""
-
-        return self._save_document(
-            tier="principle",
-            key=key,
-            title=title,
-            content=content,
-            format=format,
-            source_type=source_type,
-            source_ref=source_ref,
+        """写入 long-term 文件 + 重建索引。"""
+        self._long_term_dir.mkdir(parents=True, exist_ok=True)
+        file_path = self._long_term_dir / f"{key}.md"
+        file_path.write_text(content, encoding="utf-8")
+        self._upsert_memory_index(
+            scope="long_term",
+            session_id=None,
+            ref_path=file_path,
+            summary=self._build_summary(content),
         )
+        self._index_document_vector(tier="long_term", key=key, content=content)
+        self._write_audit_log(
+            operator=operator,
+            action="update_long_term",
+            entity_type="long_term",
+            entity_id=key,
+            diff_summary=change_note or f"Long-term memory '{key}' updated",
+        )
+        logger.info("long_term_saved", key=key, path=str(file_path))
+        return file_path
+
+    def sync_long_term_index(self) -> int:
+        """检测 long-term 目录文件与索引一致性，不一致则重建。返回同步数量。"""
+        if not self._long_term_dir.exists():
+            return 0
+        synced = 0
+        for fp in self._long_term_dir.glob("*.md"):
+            try:
+                content = fp.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            summary = self._build_summary(content)
+            row = self._get_memory_index(scope="long_term", ref_path=str(fp))
+            if row and row.get("summary") == summary:
+                continue
+            self._upsert_memory_index(
+                scope="long_term",
+                session_id=None,
+                ref_path=fp,
+                summary=summary,
+            )
+            self._index_document_vector(tier="long_term", key=fp.stem, content=content)
+            synced += 1
+        if synced:
+            logger.info("long_term_index_synced", count=synced)
+        return synced
+
+    # ── Short-term（data/memory/short_term/）────────────────
 
     def save_short_term(self, session_id: str, content: str) -> Path:
         """保存短期会话日志（按日归档的 Markdown 文件）。"""
@@ -74,26 +202,7 @@ class MemoryService:
         )
         return file_path
 
-    def save_long_term(
-        self,
-        key: str,
-        content: str,
-        *,
-        title: str = "",
-        format: str = "markdown",
-        source_type: str = "manual",
-        source_ref: str | None = None,
-    ) -> Path:
-        """保存长期记忆（可编辑的 Markdown 文件）。"""
-        return self._save_document(
-            tier="long_term",
-            key=key,
-            title=title,
-            content=content,
-            format=format,
-            source_type=source_type,
-            source_ref=source_ref,
-        )
+    # ── 统一检索 ──────────────────────────────────────────
 
     def search_files(
         self,
@@ -188,38 +297,22 @@ class MemoryService:
             logger.error("vector_search_failed", error=str(exc))
             return self._search_vector_fallback(query, top_k=top_k, source_types=source_types, source_id=source_id)
 
-    def _save_document(
-        self,
-        *,
-        tier: str,
-        key: str,
-        title: str,
-        content: str,
-        format: str,
-        source_type: str,
-        source_ref: str | None,
-    ) -> Path:
-        normalized_tier = self._normalize_document_tier(tier)
-        suffix = self._normalize_format(format)
-        file_path = self._data_dir / normalized_tier / f"{key}{suffix}"
-        file_path.write_text(content, encoding="utf-8")
-        self._upsert_memory_document(
-            tier=normalized_tier,
-            key=key,
-            title=title,
-            content=content,
-            format=format,
-            source_type=source_type,
-            source_ref=source_ref,
-        )
-        self._upsert_memory_index(
-            scope=normalized_tier,
-            session_id=None,
-            ref_path=file_path,
-            summary=self._build_summary(content),
-        )
-        self._index_document_vector(tier=normalized_tier, key=key, content=content)
-        return file_path
+    # ── 内部方法 ────────────────────────────────────────
+
+    def _iter_scope_files(self, scope: str, *, session_id: str | None) -> list[Path]:
+        if scope == "principle":
+            return [self._principle_file] if self._principle_file.exists() else []
+        if scope == "long_term":
+            if not self._long_term_dir.exists():
+                return []
+            return [p for p in self._long_term_dir.glob("*.md") if p.is_file()]
+        dir_path = self._data_dir / scope
+        if not dir_path.exists():
+            return []
+        files = [path for path in dir_path.rglob("*") if path.is_file()]
+        if scope != "short_term" or not session_id:
+            return files
+        return [path for path in files if path.stem == session_id]
 
     def _normalize_scopes(self, scope: str) -> list[str]:
         normalized = (scope or "long_term").strip().lower()
@@ -229,73 +322,14 @@ class MemoryService:
             raise ValueError(f"unsupported memory scope: {scope}")
         return [normalized]
 
-    def _normalize_document_tier(self, tier: str) -> str:
-        normalized = (tier or "").strip().lower()
-        if normalized not in DOCUMENT_TIERS:
-            raise ValueError(f"unsupported document tier: {tier}")
-        return normalized
-
-    def _normalize_format(self, format: str) -> str:
-        normalized = (format or "markdown").strip().lower()
-        if normalized not in FORMAT_SUFFIX:
-            raise ValueError(f"unsupported memory format: {format}")
-        return FORMAT_SUFFIX[normalized]
-
-    def _iter_scope_files(self, scope: str, *, session_id: str | None) -> list[Path]:
-        dir_path = self._data_dir / scope
-        if not dir_path.exists():
-            return []
-        files = [path for path in dir_path.rglob("*") if path.is_file()]
-        if scope != "short_term" or not session_id:
-            return files
-        return [path for path in files if path.stem == session_id]
-
-    def _upsert_memory_document(
-        self,
-        *,
-        tier: str,
-        key: str,
-        title: str,
-        content: str,
-        format: str,
-        source_type: str,
-        source_ref: str | None,
-    ) -> None:
+    def _get_memory_index(self, *, scope: str, ref_path: str) -> dict[str, Any] | None:
         if self._db is None:
-            return
-        now = self._utcnow()
-        existing = self._db.execute(
-            "SELECT created_at FROM memory_documents WHERE tier = ? AND key = ?",
-            (tier, key),
+            return None
+        row = self._db.execute(
+            "SELECT summary, updated_at FROM memory_index WHERE id = ?",
+            (self._build_memory_index_id(scope=scope, session_id=None, ref_path=ref_path),),
         ).fetchone()
-        created_at = existing["created_at"] if existing else now
-        self._db.execute(
-            """
-            INSERT INTO memory_documents (id, tier, key, title, content, format, version, source_type, source_ref, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tier, key) DO UPDATE SET
-                title = excluded.title,
-                content = excluded.content,
-                format = excluded.format,
-                source_type = excluded.source_type,
-                source_ref = excluded.source_ref,
-                updated_at = excluded.updated_at
-            """,
-            (
-                self._build_memory_index_id(scope=tier, session_id=None, ref_path=f"{tier}:{key}"),
-                tier,
-                key,
-                title,
-                content,
-                format,
-                "v1",
-                source_type,
-                source_ref,
-                created_at,
-                now,
-            ),
-        )
-        self._db.commit()
+        return dict(row) if row else None
 
     def _upsert_memory_index(self, *, scope: str, session_id: str | None, ref_path: Path, summary: str) -> None:
         if self._db is None:
@@ -312,6 +346,35 @@ class MemoryService:
                 str(ref_path),
                 summary,
                 None,
+                self._utcnow(),
+            ),
+        )
+        self._db.commit()
+
+    def _write_audit_log(
+        self,
+        *,
+        operator: str,
+        action: str,
+        entity_type: str,
+        entity_id: str,
+        diff_summary: str = "",
+    ) -> None:
+        if self._db is None:
+            return
+        self._db.execute(
+            """
+            INSERT INTO audit_logs (id, operator, action, entity_type, entity_id, version, diff_summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                hashlib.sha256(f"{action}:{entity_id}:{self._utcnow()}".encode()).hexdigest()[:16],
+                operator,
+                action,
+                entity_type,
+                entity_id,
+                "v1",
+                diff_summary,
                 self._utcnow(),
             ),
         )
@@ -373,6 +436,13 @@ class MemoryService:
     def _build_summary(self, text: str, *, limit: int = 200) -> str:
         collapsed = " ".join(text.split())
         return collapsed[:limit]
+
+    def _extract_title(self, text: str) -> str:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                return stripped[2:].strip()
+        return ""
 
     def _build_snippet(self, text: str, query_lower: str, *, limit: int = 500) -> str:
         lowered = text.lower()

@@ -1,4 +1,9 @@
-"""提示词编排器 — 对应 SPEC §18 src/agents/prompt。"""
+"""提示词编排器 — 对应 SPEC §18 src/agents/prompt。
+
+注入顺序（SPEC FR-005）：
+base prompt -> principle（全文） -> long-term（索引摘要） -> short-term
+-> available skills catalog -> activated skill content -> tool descriptions
+"""
 
 from __future__ import annotations
 
@@ -10,14 +15,17 @@ from src.models.llm import ChatMessage
 def compose_system_prompt(
     *,
     base_prompt: str = "",
+    principle: str = "",
+    long_term_context: str = "",
+    short_term_context: str = "",
     available_skills_catalog: list[dict[str, Any]] | None = None,
     activated_skills: list[dict[str, Any]] | None = None,
     tool_descriptions: list[dict[str, Any]] | None = None,
-    memory_context: str = "",
 ) -> str:
-    """组装 system prompt。"""
+    """按 SPEC FR-005 注入顺序组装 system prompt。"""
     parts: list[str] = []
 
+    # 1. Base prompt
     if base_prompt:
         parts.append(base_prompt)
     else:
@@ -27,6 +35,19 @@ def compose_system_prompt(
             "当任务明显需要某个 Skill 时，先查看可用 Skill 目录，再调用 activate_skill 按需加载对应 Skill。"
         )
 
+    # 2. Principle（全局约束）
+    if principle:
+        parts.append(f"\n## 系统原则\n{principle}")
+
+    # 3. Long-term 记忆（全局共享知识）
+    if long_term_context:
+        parts.append(f"\n## 长期记忆\n{long_term_context}")
+
+    # 4. Short-term / 会话快照
+    if short_term_context:
+        parts.append(f"\n## 会话记忆\n{short_term_context}")
+
+    # 5. Available skills catalog
     if available_skills_catalog:
         catalog_lines = [
             f"- {item.get('skill_name') or item.get('name')}: {item.get('description', '')}".strip()
@@ -35,6 +56,7 @@ def compose_system_prompt(
         if catalog_lines:
             parts.append("\n## 可用 Skill 目录\n" + "\n".join(catalog_lines))
 
+    # 6. Activated skill content
     if activated_skills:
         blocks = []
         for item in activated_skills:
@@ -50,9 +72,7 @@ def compose_system_prompt(
         if blocks:
             parts.append("\n## 已激活 Skills\n" + "\n\n".join(blocks))
 
-    if memory_context:
-        parts.append(f"\n## 相关记忆\n{memory_context}")
-
+    # 7. Tool descriptions
     if tool_descriptions:
         tool_lines = [
             f"- {item.get('name')}: {item.get('description', '')}".strip()

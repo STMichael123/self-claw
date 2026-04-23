@@ -23,13 +23,11 @@ const el = {
     chatMeta: document.getElementById('chat-meta'),
     chatSummary: document.getElementById('chat-summary'),
     taskMode: document.getElementById('task-mode'),
-    chatSkill: document.getElementById('chat-skill'),
     selectedSessionText: document.getElementById('selected-session-text'),
     statusOverviewList: document.getElementById('status-overview-list'),
     statusRunTree: document.getElementById('status-run-tree'),
     skillsList: document.getElementById('skills-list'),
     skillsSummary: document.getElementById('skills-summary'),
-    skillDraftsList: document.getElementById('skill-drafts-list'),
     skillSearch: document.getElementById('skill-search'),
     tasksList: document.getElementById('tasks-list'),
     tasksSummary: document.getElementById('tasks-summary'),
@@ -40,7 +38,6 @@ const el = {
     skillFilter: document.getElementById('skill-filter'),
     healthDot: document.getElementById('health-dot'),
     healthText: document.getElementById('health-text'),
-    skillModal: document.getElementById('modal-skill'),
     chatNav: document.querySelector('.nav-chat'),
     toastStack: document.getElementById('toast-stack'),
     sessionModal: document.getElementById('modal-session'),
@@ -71,8 +68,6 @@ document.getElementById('btn-refresh-skills').addEventListener('click', () => lo
 document.getElementById('btn-refresh-tasks').addEventListener('click', () => loadTasks());
 document.getElementById('btn-refresh-tools').addEventListener('click', () => loadTools());
 document.getElementById('btn-close-session').addEventListener('click', () => closeCurrentSession());
-document.getElementById('btn-new-skill').addEventListener('click', () => el.skillModal.classList.remove('hidden'));
-document.getElementById('form-skill').addEventListener('submit', createSkill);
 document.getElementById('form-task').addEventListener('submit', createTask);
 el.sessionForm.addEventListener('submit', submitTitleModal);
 el.sessionCancel.addEventListener('click', () => resolveTitleModal({ cancelled: true, value: '' }));
@@ -141,32 +136,10 @@ el.skillsList.addEventListener('click', async event => {
             method: 'POST',
             body: { action: button.dataset.nextAction, operator: USER_ID },
         });
-        await Promise.all([loadSkills(), loadChatSkills()]);
+        await Promise.all([loadSkills(), loadTaskSkills()]);
         showToast(button.dataset.nextAction === 'enable' ? 'Skill 已启用' : 'Skill 已停用', 'success');
     } catch (error) {
         showToast(error.message || 'Skill 状态更新失败', 'error');
-    }
-});
-
-el.skillDraftsList.addEventListener('click', async event => {
-    const button = findClosestFromEvent(event, '[data-draft-id]');
-    if (!button) {
-        return;
-    }
-    const decision = button.dataset.decision;
-    const endpoint = decision === 'approve' ? 'approve' : 'reject';
-    try {
-        await requestJSON(`/skills/drafts/${button.dataset.draftId}/${endpoint}`, {
-            method: 'POST',
-            body: {
-                reviewer: USER_ID,
-                note: decision === 'approve' ? 'approved from web console' : 'rejected from web console',
-            },
-        });
-        await Promise.all([loadSkills(), loadChatSkills()]);
-        showToast(decision === 'approve' ? '草稿已批准并发布' : '草稿已拒绝', 'success');
-    } catch (error) {
-        showToast(error.message || '草稿审核失败', 'error');
     }
 });
 
@@ -514,7 +487,6 @@ function renderLiveMessage(liveRun) {
     ` : '';
 
     return `
-        <div class="msg user live"><div>${escapeHTML(liveRun.userMessage || '')}</div></div>
         <div class="msg assistant live">
             <div>${escapeHTML(liveRun.reply || 'Agent 正在处理中...')}</div>
             ${usageHtml}
@@ -522,7 +494,6 @@ function renderLiveMessage(liveRun) {
                 <div class="msg-steps">
                     ${steps.map(step => `
                         <div class="step-card">
-                            <strong>步骤 ${escapeHTML(step.step || '')}</strong>
                             <div>${escapeHTML(step.thinking || step.action || '')}</div>
                             ${step.action ? `<div class="table-muted">工具 ${escapeHTML(step.action)} ${escapeHTML(JSON.stringify(step.action_input || {}))}</div>` : ''}
                             ${step.observation ? `<div class="table-muted">${escapeHTML(step.observation)}</div>` : ''}
@@ -541,7 +512,6 @@ function renderMessage(message) {
         <div class="msg-steps">
             ${steps.map(step => `
                 <div class="step-card">
-                    <strong>步骤 ${escapeHTML(step.step || '')}</strong>
                     <div>${escapeHTML(step.thinking || step.action || '')}</div>
                     ${step.observation ? `<div class="table-muted">${escapeHTML(step.observation)}</div>` : ''}
                 </div>
@@ -583,7 +553,6 @@ async function sendMessage() {
     }
 
     el.chatSend.disabled = true;
-    const requestedSkillName = el.chatSkill.value || null;
 
     try {
         startLiveRun({
@@ -600,7 +569,6 @@ async function sendMessage() {
                 session_title: newTaskTitle || null,
                 stream: true,
                 user_id: USER_ID,
-                requested_skill_name: requestedSkillName,
             },
             onEvent: handleChatStreamEvent,
         });
@@ -655,7 +623,9 @@ function renderLiveOnly() {
         '状态 处理中',
         `会话 ${title}`,
     ].map(renderSummaryPill).join('');
-    el.chatMessages.innerHTML = renderLiveMessage(state.liveRun);
+    el.chatMessages.innerHTML = `
+        <div class="msg user live"><div>${escapeHTML(state.liveRun.userMessage || '')}</div></div>
+    ` + renderLiveMessage(state.liveRun);
     el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
 }
 
@@ -964,21 +934,19 @@ async function loadSkills() {
             params.set('keyword', keyword);
         }
         const suffix = params.size ? `?${params.toString()}` : '';
-        const [skills, drafts] = await Promise.all([
+        const [skills] = await Promise.all([
             fetchJSON(`/skills${suffix}`),
-            fetchJSON('/skills/drafts?review_status=draft'),
         ]);
-        renderSkillsSummary(skills, drafts);
+        renderSkillsSummary(skills);
 
         if (!skills.length) {
-            el.skillsList.innerHTML = '<tr><td colspan="6" class="empty">暂无 Skill</td></tr>';
+            el.skillsList.innerHTML = '<tr><td colspan="5" class="empty">暂无 Skill</td></tr>';
         } else {
             el.skillsList.innerHTML = skills.map(skill => `
                 <tr>
                     <td><strong>${escapeHTML(skill.skill_name || skill.name)}</strong><div class="table-muted">${escapeHTML(skill.description || '')}</div></td>
                     <td>${renderBadge(skill.status)}</td>
                     <td>${escapeHTML(skill.source || 'project')}</td>
-                    <td>${escapeHTML(skill.last_approved_revision || skill.latest_revision || '-')}</td>
                     <td>${escapeHTML(formatTime(skill.last_indexed_at || skill.indexed_at))}</td>
                     <td>
                         <button class="btn btn-secondary" data-skill-name="${escapeHTML(skill.skill_name || skill.name)}" data-next-action="${skill.status === 'enabled' ? 'disable' : 'enable'}">
@@ -989,96 +957,35 @@ async function loadSkills() {
             `).join('');
         }
 
-        if (!drafts.length) {
-            el.skillDraftsList.innerHTML = '<div class="empty-state">暂无待审核草稿</div>';
-            return;
-        }
-
-        el.skillDraftsList.innerHTML = drafts.map(draft => `
-            <div class="stack-item">
-                <div class="stack-item-head">
-                    <strong>${escapeHTML(draft.proposed_name || draft.target_skill_name || draft.draft_id)}</strong>
-                    ${renderBadge(draft.review_status || 'draft')}
-                </div>
-                <div class="stack-item-meta">
-                    <span>${escapeHTML(draft.requested_action || 'create')}</span>
-                    <span>${escapeHTML(formatTime(draft.updated_at))}</span>
-                </div>
-                <div>${escapeHTML(draft.user_intent_summary || '未填写意图摘要')}</div>
-                <div class="approval-actions">
-                    <button class="btn btn-secondary" data-draft-id="${escapeHTML(draft.draft_id)}" data-decision="reject">拒绝</button>
-                    <button class="btn btn-primary" data-draft-id="${escapeHTML(draft.draft_id)}" data-decision="approve">批准</button>
-                </div>
-            </div>
-        `).join('');
     } catch (error) {
-        el.skillsList.innerHTML = '<tr><td colspan="6" class="empty">Skill 目录加载失败</td></tr>';
-        el.skillDraftsList.innerHTML = '<div class="empty-state">草稿列表加载失败</div>';
+        el.skillsList.innerHTML = '<tr><td colspan="5" class="empty">Skill 目录加载失败</td></tr>';
         showToast(error.message || 'Skill 目录加载失败', 'error');
     }
 }
 
-function renderSkillsSummary(skills, drafts) {
+function renderSkillsSummary(skills) {
     const enabled = skills.filter(skill => skill.status === 'enabled').length;
     const disabled = skills.filter(skill => skill.status === 'disabled').length;
     el.skillsSummary.innerHTML = [
         `目录总数 ${skills.length}`,
         `启用 ${enabled}`,
         `停用 ${disabled}`,
-        `待处理 ${drafts.length}`,
     ].map(renderSummaryPill).join('');
 }
 
-async function loadChatSkills() {
+async function loadTaskSkills() {
     try {
         const skills = await fetchJSON('/skills?status=enabled');
-        const currentValue = el.chatSkill.value;
         const taskSkillValue = el.taskSkill.value;
         const options = ['<option value="">默认</option>']
             .concat(skills.map(skill => `<option value="${escapeHTML(skill.skill_name || skill.name)}">${escapeHTML(skill.skill_name || skill.name)}${skill.description ? ` · ${escapeHTML(skill.description)}` : ''}</option>`))
             .join('');
-        el.chatSkill.innerHTML = options;
         el.taskSkill.innerHTML = options;
-        if (currentValue) {
-            el.chatSkill.value = currentValue;
-        }
         if (taskSkillValue) {
             el.taskSkill.value = taskSkillValue;
         }
     } catch (error) {
         showToast(error.message || 'Skill 选项加载失败', 'error');
-    }
-}
-
-async function createSkill(event) {
-    event.preventDefault();
-    const form = event.target;
-    const allowedTools = String(form.allowed_tools.value || '')
-        .split(',')
-        .map(item => item.trim())
-        .filter(Boolean);
-    try {
-        await requestJSON('/skills/drafts', {
-            method: 'POST',
-            body: {
-                requested_action: 'create',
-                proposed_name: form.name.value,
-                draft_skill_md: buildSkillMarkdown({
-                    name: form.name.value,
-                    description: form.description.value,
-                    content: form.content.value,
-                    allowedTools,
-                }),
-                operator: USER_ID,
-                user_intent_summary: form.description.value,
-            },
-        });
-        form.reset();
-        el.skillModal.classList.add('hidden');
-        await Promise.all([loadSkills(), loadChatSkills()]);
-        showToast('Skill 草稿已创建，等待审核', 'success');
-    } catch (error) {
-        showToast(error.message || 'Skill 草稿创建失败', 'error');
     }
 }
 
@@ -1258,25 +1165,6 @@ function renderSummaryPill(text) {
     return `<span class="summary-pill">${escapeHTML(text)}</span>`;
 }
 
-function buildSkillMarkdown({ name, description, content, allowedTools }) {
-    const tools = Array.isArray(allowedTools) && allowedTools.length
-        ? `allowed-tools:\n${allowedTools.map(item => `  - ${item}`).join('\n')}`
-        : 'allowed-tools: []';
-    return [
-        '---',
-        `name: ${name}`,
-        `description: ${description}`,
-        'compatibility: self-claw@1.0',
-        tools,
-        'metadata:',
-        '  source: web-console',
-        '---',
-        '',
-        content || `# ${name}\n\n${description}`,
-        '',
-    ].join('\n');
-}
-
 function escapeHTML(value) {
     if (value == null) {
         return '';
@@ -1306,7 +1194,7 @@ function formatTime(value) {
 
 async function bootstrap() {
     await checkHealth();
-    await Promise.all([loadEntry(), loadStatusOverview(false), loadChatSkills()]);
+    await Promise.all([loadEntry(), loadStatusOverview(false), loadTaskSkills()]);
     window.setInterval(checkHealth, 30000);
 }
 

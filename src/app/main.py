@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -16,6 +17,7 @@ from src.channels.adapter import ChannelRegistry, TestChannelAdapter
 from src.config import get_settings
 from src.services.agent_service import AgentService
 from src.services.file_workspace import FileWorkspaceService
+from src.services.hook_service import HookRegistry
 from src.services.memory import MemoryService
 from src.services.notification import NotificationService
 from src.services.scheduler import SchedulerService
@@ -34,6 +36,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     settings.sandbox_root_path.mkdir(parents=True, exist_ok=True)
     settings.skill_root_path.mkdir(parents=True, exist_ok=True)
+    settings.principle_file_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.long_term_memory_dir_path.mkdir(parents=True, exist_ok=True)
+    Path("data/memory/archives").mkdir(parents=True, exist_ok=True)
+    Path(".agents/hooks").mkdir(parents=True, exist_ok=True)
 
     # 初始化数据库
     db = get_connection(settings.database_path)
@@ -41,7 +47,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.settings = settings
     app.state.skill_service = SkillService(db, skill_root=settings.skill_root_path)
     app.state.skill_service.reload_catalog()
-    app.state.memory_service = MemoryService(data_dir=settings.memory_data_dir, db=db)
+    app.state.memory_service = MemoryService(
+        data_dir=settings.memory_data_dir,
+        principle_file=str(settings.principle_file_path),
+        long_term_dir=str(settings.long_term_memory_dir_path),
+        db=db,
+    )
+    app.state.memory_service.sync_principle_index()
+    app.state.memory_service.sync_long_term_index()
     app.state.file_workspace_service = FileWorkspaceService(
         db,
         sandbox_root=settings.file_sandbox_root,
@@ -53,6 +66,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.channel_registry = ChannelRegistry()
     app.state.channel_registry.register("test", TestChannelAdapter())
     app.state.notification_service = NotificationService(app.state.channel_registry)
+    app.state.hook_registry = HookRegistry()
+    app.state.hook_registry.discover_hooks(settings.skill_root_path.parent / "hooks")
     app.state.scheduler_service = SchedulerService()
     app.state.scheduler_service.start()
     app.state.agent_service = AgentService(
@@ -61,6 +76,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         memory_service=app.state.memory_service,
         file_workspace_service=app.state.file_workspace_service,
         notification_service=app.state.notification_service,
+        hook_registry=app.state.hook_registry,
+        max_parallel_sub_agents=settings.max_parallel_sub_agents,
+        max_parallel_main_runs=settings.max_parallel_main_runs,
+        model_name=os.environ.get("LLM_MODEL", "gpt-4o"),
     )
     app.state.task_service = TaskService(
         db,

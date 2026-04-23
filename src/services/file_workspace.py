@@ -214,6 +214,47 @@ class FileWorkspaceService:
             if lock_path:
                 self._release_write_lock(lock_path, owner_run_id=run_id)
 
+    def list_operations(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """查询文件操作审计记录。"""
+        query = "SELECT * FROM file_operations WHERE 1 = 1"
+        params: list[Any] = []
+        if session_id:
+            query += " AND session_id = ?"
+            params.append(session_id)
+        if run_id:
+            query += " AND agent_run_id = ?"
+            params.append(run_id)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY started_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._db.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_locks(self, *, sandbox_path: str | None = None) -> list[dict[str, Any]]:
+        """查询当前活跃文件锁。"""
+        now = datetime.now(timezone.utc).isoformat()
+        self._db.execute(
+            "DELETE FROM file_locks WHERE expires_at <= ?",
+            (now,),
+        )
+        self._db.commit()
+        query = "SELECT * FROM file_locks WHERE 1 = 1"
+        params: list[Any] = []
+        if sandbox_path:
+            query += " AND sandbox_path = ?"
+            params.append(sandbox_path)
+        rows = self._db.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
     def _resolve_path(self, path: str) -> tuple[Path, str]:
         raw = self._normalize_operation_path(path)
         requested = Path(raw)

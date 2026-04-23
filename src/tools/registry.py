@@ -30,6 +30,7 @@ class ToolDescriptor:
         returns: dict[str, Any] | None = None,
         requires_approval: bool = False,
         timeout_sec: int = 30,
+        concurrency_safe: bool = False,
         category: str = "custom",
         handler: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
@@ -40,6 +41,7 @@ class ToolDescriptor:
         self.returns = returns or {}
         self.requires_approval = requires_approval
         self.timeout_sec = timeout_sec
+        self.concurrency_safe = concurrency_safe
         self.category = category
         self.handler = handler
 
@@ -51,6 +53,7 @@ class ToolDescriptor:
             "parameters": self.parameters,
             "returns": self.returns,
             "requires_approval": self.requires_approval,
+            "concurrency_safe": self.concurrency_safe,
             "category": self.category,
         }
 
@@ -261,6 +264,7 @@ def tool(
     parameters: dict[str, Any] | None = None,
     requires_approval: bool = False,
     timeout_sec: int = 30,
+    concurrency_safe: bool = False,
 ) -> Callable:
     """装饰器：将 async 函数注册为工具。"""
 
@@ -271,6 +275,7 @@ def tool(
             parameters=parameters,
             requires_approval=requires_approval,
             timeout_sec=timeout_sec,
+            concurrency_safe=concurrency_safe,
             handler=fn,
         )
         return fn

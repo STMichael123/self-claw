@@ -64,6 +64,21 @@ class TaskService:
             return None
         return self._serialize_task(self._row_to_task(row), include_history=True)
 
+    def parse_schedule(self, schedule_text: str) -> dict[str, Any]:
+        """解析调度文本并返回预览结果，不创建任务。"""
+        parsed = parse_schedule_text(schedule_text)
+        self.scheduler.validate_schedule(
+            schedule_type=str(parsed["schedule_type"]),
+            schedule_expr=str(parsed["schedule_expr"]),
+        )
+        return {
+            "schedule_text": schedule_text,
+            "schedule_type": parsed["schedule_type"],
+            "schedule_expr": parsed["schedule_expr"],
+            "next_run_at": parsed["next_run_at"],
+            "human_schedule": describe_schedule(parsed["schedule_type"], parsed["schedule_expr"]),
+        }
+
     def create_task(
         self,
         *,

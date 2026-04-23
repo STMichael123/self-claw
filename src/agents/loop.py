@@ -19,6 +19,8 @@ from src.agents.prompt import build_messages, compose_system_prompt
 
 logger = structlog.get_logger()
 
+HOOK_REGISTRY_ATTR = "hook_registry"
+
 DEFAULT_MAX_STEPS = 10
 
 
@@ -35,6 +37,7 @@ class AgentLoop:
         cancellation_checker: Callable[[], bool] | None = None,
         cancellation_waiter: Callable[[], Awaitable[None]] | None = None,
         approval_requester: Callable[[str, dict[str, Any], Any], Awaitable[dict[str, Any]]] | None = None,
+        hook_registry: Any | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools or {}  # name -> tool_descriptor
@@ -43,6 +46,7 @@ class AgentLoop:
         self.cancellation_checker = cancellation_checker
         self.cancellation_waiter = cancellation_waiter
         self.approval_requester = approval_requester
+        self._hook_registry = hook_registry
 
     async def run(
         self,
@@ -84,6 +88,13 @@ class AgentLoop:
             for step_num in range(next_step, self.max_steps + 1):
                 log = logger.bind(run_id=run_id, step=step_num)
                 self._ensure_not_cancelled(run_id)
+
+                await self._run_hook("pre_agent_loop_step", {
+                    "step_number": step_num,
+                    "activated_skills": list(runtime_state.get("activated_skills") or []),
+                    "session_id": runtime_state.get("session_id"),
+                    "run_id": run_id,
+                })
 
                 resp = await self._await_with_cancellation(
                     self.llm.chat(current_messages, tools=tool_defs),
@@ -212,8 +223,20 @@ class AgentLoop:
         except json.JSONDecodeError:
             return f"Error: invalid JSON arguments"
 
+        # pre_tool_call hook
+        hook_ctx = await self._run_hook("pre_tool_call", {
+            "tool_name": tool_name,
+            "parameters": args,
+            "agent_run_id": run_id,
+        })
+        if hook_ctx.get("abort"):
+            logger.info("tool_aborted_by_hook", run_id=run_id, tool=tool_name)
+            return f"Error: tool '{tool_name}' aborted by pre_tool_call hook"
+
         try:
             runtime_context["run_id"] = run_id
+            import time
+            start = time.monotonic()
             result = await self.tool_executor.execute(
                 tool_name,
                 args,
@@ -221,7 +244,19 @@ class AgentLoop:
                 approval_context=approval_context,
                 runtime_context=runtime_context,
             )
-            return str(result)
+            duration_ms = int((time.monotonic() - start) * 1000)
+            result_str = str(result)
+
+            # post_tool_call hook
+            await self._run_hook("post_tool_call", {
+                "tool_name": tool_name,
+                "parameters": args,
+                "result": result_str,
+                "duration_ms": duration_ms,
+                "agent_run_id": run_id,
+            })
+
+            return result_str
         except ToolApprovalRequired:
             raise
         except ToolCancelledError as exc:
@@ -248,6 +283,8 @@ class AgentLoop:
         next_tool_index = int(pending_bundle.get("next_tool_index", 0))
         approval_context = approved_approval
 
+        # Group remaining tool calls by concurrency_safe
+        remaining_calls = []
         for tool_index in range(next_tool_index, len(tool_calls)):
             raw_tool_call = tool_calls[tool_index]
             tool_call = raw_tool_call if isinstance(raw_tool_call, dict) else {}
@@ -255,16 +292,156 @@ class AgentLoop:
             tool_arguments = str(tool_call.get("arguments", ""))
             tool_call_id = str(tool_call.get("id", ""))
             action_input = json.loads(tool_arguments) if tool_arguments else {}
+            is_safe = self._is_concurrency_safe(tool_name)
+            remaining_calls.append({
+                "index": tool_index,
+                "tool_name": tool_name,
+                "tool_arguments": tool_arguments,
+                "tool_call_id": tool_call_id,
+                "action_input": action_input,
+                "concurrency_safe": is_safe,
+            })
 
-            await self._emit_event(
-                event_callback,
-                {
-                    "event": "action",
-                    "step": step_num,
-                    "name": tool_name,
-                    "input": action_input,
-                },
+        # Execute in two phases: safe tools in parallel, then unsafe tools serially
+        for phase_safe in (True, False):
+            phase_calls = [tc for tc in remaining_calls if tc["concurrency_safe"] == phase_safe]
+            if not phase_calls:
+                continue
+
+            if phase_safe and len(phase_calls) > 1:
+                # Parallel execution for concurrency_safe tools
+                await self._execute_tool_calls_parallel(
+                    phase_calls,
+                    current_messages=current_messages,
+                    steps=steps,
+                    run_id=run_id,
+                    step_num=step_num,
+                    thinking=thinking,
+                    runtime_context=runtime_context,
+                    approval_context=approval_context,
+                    event_callback=event_callback,
+                    pending_bundle=pending_bundle,
+                )
+            else:
+                # Serial execution for unsafe tools or single safe tool
+                for tc in phase_calls:
+                    await self._execute_single_tool_call(
+                        tc,
+                        current_messages=current_messages,
+                        steps=steps,
+                        run_id=run_id,
+                        step_num=step_num,
+                        thinking=thinking,
+                        runtime_context=runtime_context,
+                        approval_context=approval_context,
+                        event_callback=event_callback,
+                        pending_bundle=pending_bundle,
+                    )
+                    approval_context = None
+
+        # post_agent_loop_step hook
+        last_observation = steps[-1].observation if steps else ""
+        await self._run_hook("post_agent_loop_step", {
+            "step_number": step_num,
+            "action_type": "tool_calls" if tool_calls else "reply",
+            "observation_summary": last_observation[:200],
+        })
+
+    async def _execute_single_tool_call(
+        self,
+        tc: dict[str, Any],
+        *,
+        current_messages: list[ChatMessage],
+        steps: list[ReActStep],
+        run_id: str,
+        step_num: int,
+        thinking: str,
+        runtime_context: dict[str, Any],
+        approval_context: dict[str, Any] | None,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        pending_bundle: dict[str, Any],
+    ) -> None:
+        """Execute a single tool call and record the result."""
+        tool_name = tc["tool_name"]
+        tool_arguments = tc["tool_arguments"]
+        tool_call_id = tc["tool_call_id"]
+        action_input = tc["action_input"]
+
+        await self._emit_event(event_callback, {
+            "event": "action",
+            "step": step_num,
+            "name": tool_name,
+            "input": action_input,
+        })
+
+        self._ensure_not_cancelled(run_id)
+        try:
+            observation = await self._execute_tool(
+                tool_name,
+                tool_arguments,
+                run_id=run_id,
+                runtime_context=runtime_context,
+                approval_context=approval_context,
             )
+        except ToolApprovalRequired as exc:
+            pending_bundle["next_tool_index"] = tc["index"]
+            raise LoopApprovalPending(
+                pending_approval={
+                    "approval_id": exc.approval_id,
+                    "tool_name": exc.tool_name,
+                    "arguments": exc.args,
+                },
+                pending_bundle=pending_bundle,
+            ) from exc
+
+        self._ensure_not_cancelled(run_id)
+        steps.append(ReActStep(
+            step=step_num,
+            thinking=thinking,
+            action=tool_name,
+            action_input=action_input,
+            observation=observation,
+        ))
+        current_messages.append(ChatMessage(role="tool", content=observation, tool_call_id=tool_call_id))
+        if tool_name == "activate_skill":
+            await self._emit_event(event_callback, {
+                "event": "skill_activation",
+                "step": step_num,
+                "skill_name": action_input.get("skill_name"),
+                "content": observation,
+            })
+        await self._emit_event(event_callback, {
+            "event": "observation",
+            "step": step_num,
+            "content": observation,
+        })
+
+    async def _execute_tool_calls_parallel(
+        self,
+        calls: list[dict[str, Any]],
+        *,
+        current_messages: list[ChatMessage],
+        steps: list[ReActStep],
+        run_id: str,
+        step_num: int,
+        thinking: str,
+        runtime_context: dict[str, Any],
+        approval_context: dict[str, Any] | None,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        pending_bundle: dict[str, Any],
+    ) -> None:
+        """Execute multiple concurrency_safe tool calls in parallel."""
+        async def _run_one(tc: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+            tool_name = tc["tool_name"]
+            tool_arguments = tc["tool_arguments"]
+            action_input = tc["action_input"]
+
+            await self._emit_event(event_callback, {
+                "event": "action",
+                "step": step_num,
+                "name": tool_name,
+                "input": action_input,
+            })
 
             self._ensure_not_cancelled(run_id)
             try:
@@ -273,49 +450,63 @@ class AgentLoop:
                     tool_arguments,
                     run_id=run_id,
                     runtime_context=runtime_context,
-                    approval_context=approval_context,
+                    approval_context=None,
                 )
-            except ToolApprovalRequired as exc:
-                pending_bundle["next_tool_index"] = tool_index
-                raise LoopApprovalPending(
-                    pending_approval={
-                        "approval_id": exc.approval_id,
-                        "tool_name": exc.tool_name,
-                        "arguments": exc.args,
-                    },
-                    pending_bundle=pending_bundle,
-                ) from exc
+            except ToolApprovalRequired:
+                # Safe tools requiring approval fall back to serial handling
+                return tc, None
+            except RunCancelledError:
+                raise
+            except Exception as exc:
+                observation = f"Error: {exc}"
+            return tc, observation
 
-            approval_context = None
-            self._ensure_not_cancelled(run_id)
-            steps.append(
-                ReActStep(
-                    step=step_num,
-                    thinking=thinking,
-                    action=tool_name,
-                    action_input=action_input,
-                    observation=observation,
-                )
-            )
+        results = await asyncio.gather(*[_run_one(tc) for tc in calls], return_exceptions=True)
+
+        for result_item in results:
+            if isinstance(result_item, BaseException):
+                logger.warning("parallel_tool_call_failed", error=str(result_item))
+                continue
+            tc, observation = result_item
+            if observation is None:
+                # Approval required — skip, will be handled on retry
+                continue
+
+            tool_name = tc["tool_name"]
+            tool_call_id = tc["tool_call_id"]
+            action_input = tc["action_input"]
+
+            steps.append(ReActStep(
+                step=step_num,
+                thinking=thinking,
+                action=tool_name,
+                action_input=action_input,
+                observation=observation,
+            ))
             current_messages.append(ChatMessage(role="tool", content=observation, tool_call_id=tool_call_id))
-            if tool_name == "activate_skill":
-                await self._emit_event(
-                    event_callback,
-                    {
-                        "event": "skill_activation",
-                        "step": step_num,
-                        "skill_name": action_input.get("skill_name"),
-                        "content": observation,
-                    },
-                )
-            await self._emit_event(
-                event_callback,
-                {
-                    "event": "observation",
-                    "step": step_num,
-                    "content": observation,
-                },
-            )
+            await self._emit_event(event_callback, {
+                "event": "observation",
+                "step": step_num,
+                "content": observation,
+            })
+
+    def _is_concurrency_safe(self, tool_name: str) -> bool:
+        """Check if a tool is marked concurrency_safe."""
+        descriptor = self.tools.get(tool_name)
+        if descriptor and isinstance(descriptor, dict):
+            return descriptor.get("concurrency_safe", False)
+        return False
+
+    async def _run_hook(self, hook_point: str, context: dict[str, Any]) -> dict[str, Any]:
+        """Run hooks from the hook registry if available."""
+        registry = self._hook_registry
+        if registry is None:
+            return context
+        try:
+            return await registry.run_hooks(hook_point, context)
+        except Exception as exc:
+            logger.warning("hook_run_error", hook_point=hook_point, error=str(exc))
+            return context
 
     def _ensure_not_cancelled(self, run_id: str) -> None:
         if self.cancellation_checker and self.cancellation_checker():

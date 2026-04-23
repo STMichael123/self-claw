@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Self-Claw 控制台</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
     <aside class="sidebar">
@@ -71,9 +71,6 @@
                             <option value="new_task">新建会话</option>
                             <option value="cancel_and_rerun">重新执行当前会话</option>
                         </select>
-                        <select id="chat-skill" class="hidden">
-                            <option value="">默认</option>
-                        </select>
                         <div class="chat-compose-row">
                             <textarea id="chat-input" rows="2" placeholder="对话框"></textarea>
                             <button class="btn btn-primary composer-send" id="chat-send">发送</button>
@@ -129,7 +126,6 @@
                         <option value="disabled">停用</option>
                     </select>
                     <button class="btn btn-secondary" id="btn-refresh-skills">刷新目录</button>
-                    <button class="btn btn-primary" id="btn-new-skill">新建</button>
                 </div>
             </header>
 
@@ -142,7 +138,6 @@
                             <th>名称</th>
                             <th>状态</th>
                             <th>来源</th>
-                            <th>最新修订</th>
                             <th>最近索引</th>
                             <th>操作</th>
                         </tr>
@@ -153,46 +148,6 @@
                 </table>
             </div>
 
-            <div class="panel-card spaced">
-                <div class="panel-header-inline">
-                    <h3>待处理</h3>
-                    <span class="table-muted">待发布</span>
-                </div>
-                <div id="skill-drafts-list" class="stack-list">
-                    <div class="empty-state">暂无待审核草稿</div>
-                </div>
-            </div>
-
-            <div class="modal hidden" id="modal-skill">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h3>新建 Skill</h3>
-                        <button class="modal-close" data-close="modal-skill">关闭</button>
-                    </div>
-                    <form id="form-skill" class="form-grid">
-                        <label class="field-label">
-                            <span>名称</span>
-                            <input type="text" name="name" required>
-                        </label>
-                        <label class="field-label">
-                            <span>描述</span>
-                            <input type="text" name="description" required>
-                        </label>
-                        <label class="field-label full">
-                            <span>允许工具（逗号分隔）</span>
-                            <input type="text" name="allowed_tools" placeholder="例如：web_fetch, read_file">
-                        </label>
-                        <label class="field-label full">
-                            <span>SKILL.md 正文</span>
-                            <textarea name="content" rows="6"></textarea>
-                        </label>
-                        <div class="modal-actions full">
-                            <button type="button" class="btn btn-secondary" data-close="modal-skill">取消</button>
-                            <button type="submit" class="btn btn-primary">创建</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
         </section>
 
         <section id="view-tasks" class="view">
@@ -301,6 +256,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=2"></script>
 </body>
 </html>

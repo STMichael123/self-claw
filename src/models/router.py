@@ -8,7 +8,7 @@ import tiktoken
 
 from src.models.dev_adapter import DevLLMAdapter
 from src.models.llm import AnthropicAdapter, LLMAdapter, OpenAIAdapter
-
+from src.models.retry import LLMRetryWrapper
 
 # ── Token 计数 ──────────────────────────────────────────
 
@@ -29,6 +29,7 @@ def max_context_tokens(model: str) -> int:
         "gpt-4-turbo": 128_000,
         "gpt-4": 8_192,
         "gpt-3.5-turbo": 16_385,
+        "gpt-4.1": 1_000_000,
         "claude-sonnet-4-20250514": 200_000,
         "claude-3-haiku-20240307": 200_000,
     }
@@ -38,7 +39,7 @@ def max_context_tokens(model: str) -> int:
 # ── 模型路由 ────────────────────────────────────────────
 
 class ModelRouter:
-    """根据配置创建 LLM 适配器，支持 fallback。"""
+    """根据配置创建 LLM 适配器，支持 fallback 与分类重试（NFR-001）。"""
 
     def __init__(self) -> None:
         self._primary_provider = os.environ.get("LLM_PROVIDER", "openai")
@@ -47,7 +48,9 @@ class ModelRouter:
         self._fallback_model = os.environ.get("LLM_FALLBACK_MODEL", "")
 
     def get_primary(self) -> LLMAdapter:
-        return self._create(self._primary_provider, self._primary_model)
+        adapter = self._create(self._primary_provider, self._primary_model)
+        fallback = self.get_fallback()
+        return LLMRetryWrapper(adapter, fallback=fallback)
 
     def get_fallback(self) -> LLMAdapter | None:
         if not self._fallback_provider or not self._fallback_model:

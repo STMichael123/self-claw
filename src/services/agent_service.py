@@ -40,17 +40,26 @@ class AgentService:
         memory_service: Any | None = None,
         file_workspace_service: Any | None = None,
         notification_service: Any | None = None,
+        hook_registry: Any | None = None,
+        max_parallel_sub_agents: int = 5,
+        max_parallel_main_runs: int = 3,
+        model_name: str = "gpt-4o",
     ) -> None:
         self._db = db
-        self.sessions = SessionManager(db)
+        self.sessions = SessionManager(db, model_name=model_name)
         self.cost = CostService(db)
         self.skill_service = skill_service
         self.memory_service = memory_service
         self.file_workspace_service = file_workspace_service
         self.notification_service = notification_service
+        self._hook_registry = hook_registry
         self.model_router = ModelRouter()
+        self._model_name = model_name
+        self.sessions.set_llm(self.model_router.get_primary())
         self.tool_registry = ToolRegistry()
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._sub_agent_semaphore = asyncio.Semaphore(max_parallel_sub_agents)
+        self._max_parallel_main_runs = max_parallel_main_runs
         for descriptor in build_builtin_tools(file_workspace_service, skill_service):
             self.tool_registry.register(descriptor)
         self.tool_executor = ToolExecutor(self.tool_registry)
@@ -95,7 +104,23 @@ class AgentService:
             return None
         self._cancel_running_main_runs(session_id)
         summary = self.sessions.generate_summary(session_id)
+        message_count = session.get("message_count") or 0
         self.sessions.close_session(session_id, summary=summary)
+
+        # on_session_archive hook (FR-016)
+        if self._hook_registry is not None:
+            import asyncio as _asyncio
+            try:
+                _asyncio.create_task(
+                    self._hook_registry.run_hooks("on_session_archive", {
+                        "session_id": session_id,
+                        "summary": summary,
+                        "message_count": message_count,
+                    })
+                )
+            except Exception as exc:
+                logger.warning("on_session_archive_hook_failed", session_id=session_id, error=str(exc))
+
         if self.memory_service is not None and summary:
             try:
                 self.memory_service.save_long_term(
@@ -136,7 +161,23 @@ class AgentService:
         task_id: str | None = None,
         task_run_log_id: str | None = None,
         event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        parse_slash: bool = True,
     ) -> dict[str, Any]:
+        # 解析斜杠命令（FR-015）
+        if parse_slash and message.startswith("/"):
+            slash_skill, slash_args = self._parse_slash_command(message)
+            if slash_skill:
+                resolved = requested_skill_name or slash_skill
+                message = slash_args
+                requested_skill_name = resolved
+            else:
+                return {
+                    "reply": slash_args,
+                    "session_id": session_id,
+                    "error": True,
+                    "error_code": "SKILL_NOT_FOUND",
+                }
+
         target_session_id, session_action = self._resolve_session(
             task_mode=task_mode,
             session_id=session_id,
@@ -152,6 +193,7 @@ class AgentService:
         skill_context = self._resolve_requested_skill_context(resolved_skill_name)
         available_skills_catalog = self._list_available_skills_catalog()
         self._validate_skill_input(skill_context, message)
+        self._ensure_main_run_capacity()
 
         try:
             run_id = self._create_run(
@@ -192,6 +234,7 @@ class AgentService:
             user_message=message,
             base_snapshot=session.get("context_snapshot") or "",
         )
+        principle_text = self.memory_service.load_principle() if self.memory_service else ""
         child_runs: list[dict[str, Any]] = []
         if self._should_spawn_sub_agent(message):
             child_run = await self._run_sub_agent(
@@ -212,13 +255,16 @@ class AgentService:
             tools=tool_defs,
             tool_executor=tool_executor,
             max_steps=int(skill_context.get("max_steps") or 10),
+            hook_registry=self._hook_registry,
         )
         result = await main_agent.chat(
             message,
             history=history,
             available_skills_catalog=available_skills_catalog,
             activated_skills=skill_context.get("activated_skills") or None,
-            memory_context=memory_context,
+            principle=principle_text,
+            long_term_context=memory_context,
+            short_term_context="",
             run_id=run_id,
             cancellation_checker=lambda: self._is_run_cancelled(run_id),
             cancellation_waiter=lambda: self._wait_for_run_cancelled(run_id),
@@ -503,19 +549,46 @@ class AgentService:
             "resumed_run_id": current["agent_run_id"],
         }
 
+    def list_file_operations(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if self.file_workspace_service is None:
+            return []
+        return self.file_workspace_service.list_operations(
+            session_id=session_id, run_id=run_id, status=status, limit=limit,
+        )
+
+    def list_file_locks(self, *, sandbox_path: str | None = None) -> list[dict[str, Any]]:
+        if self.file_workspace_service is None:
+            return []
+        return self.file_workspace_service.list_locks(sandbox_path=sandbox_path)
+
     def cost_summary(self, *, task_id: str | None = None, days: int = 7) -> dict[str, Any]:
         if task_id:
             return self.cost.get_task_summary(task_id)
         return self.cost.get_daily_summary()
 
-    async def memory_search(self, query: str, session_id: str | None = None) -> dict[str, Any]:
+    async def memory_search(
+        self,
+        query: str,
+        session_id: str | None = None,
+        tiers: list[str] | None = None,
+    ) -> dict[str, Any]:
         if self.memory_service is None:
             return {"files": [], "vectors": []}
-        files = (
-            self.memory_service.search_files(query, scope="principle")
-            + self.memory_service.search_files(query, scope="short_term", session_id=session_id)
-            + self.memory_service.search_files(query, scope="long_term")
-        )
+        selected = set(tiers) if tiers else {"principle", "long_term", "short_term"}
+        files = []
+        if "principle" in selected:
+            files += self.memory_service.search_files(query, scope="principle")
+        if "long_term" in selected:
+            files += self.memory_service.search_files(query, scope="long_term")
+        if "short_term" in selected:
+            files += self.memory_service.search_files(query, scope="short_term", session_id=session_id)
         vectors = await self.memory_service.search_vector(
             query,
             source_id=session_id,
@@ -686,21 +759,14 @@ class AgentService:
     ) -> str:
         parts: list[str] = []
         if self.memory_service is not None:
-            principle_hits = self.memory_service.search_files("", scope="principle", limit=3)
-            if principle_hits:
-                parts.append(
-                    "Principle 记忆:\n" + "\n".join(
-                        f"- {item['snippet'][:180].strip()}" for item in principle_hits if item.get("snippet")
-                    )
-                )
-
-            long_term_hits = self.memory_service.search_files(user_message, scope="long_term", limit=2)
-            if long_term_hits:
-                parts.append(
-                    "长期记忆:\n" + "\n".join(
-                        f"- {item['snippet'][:180].strip()}" for item in long_term_hits if item.get("snippet")
-                    )
-                )
+            long_term_entries = self.memory_service.list_long_term()
+            if long_term_entries:
+                lines = []
+                for entry in long_term_entries:
+                    line = f"- {entry.get('title') or entry['key']}: {entry.get('snippet', '')[:120].strip()}"
+                    line += _staleness_tag(entry.get("mtime"))
+                    lines.append(line)
+                parts.append("长期记忆（索引摘要）:\n" + "\n".join(lines))
 
         if base_snapshot.strip():
             parts.append(f"会话摘要:\n{base_snapshot.strip()}")
@@ -786,6 +852,36 @@ class AgentService:
         if self.skill_service is None:
             return []
         return self.skill_service.list_catalog(status="enabled")
+
+    def _parse_slash_command(self, message: str) -> tuple[str | None, str]:
+        """解析斜杠命令（FR-015）。返回 (skill_name, 剩余消息)。
+
+        如果 skill 不存在或已禁用，返回 (None, 错误提示)。
+        """
+        text = message[1:].strip()
+        if not text:
+            return None, "斜杠命令格式：/skill-name 或 /skill-name 参数文本"
+
+        parts = text.split(None, 1)
+        token = parts[0].lower()
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        # /skill 或 /skill create → create-skill 元技能
+        if token == "skill" or token == "create":
+            return "create-skill", args or "请引导我创建一个新的 Skill。"
+
+        # 查找已启用的 Skill
+        if self.skill_service is None:
+            return None, f"Skill 服务未配置，无法执行 /{token}"
+
+        catalog = self.skill_service.list_catalog(status="enabled")
+        matched = [s for s in catalog if (s.get("skill_name") or s.get("name") or "").lower() == token]
+        if not matched:
+            available = ", ".join(s.get("skill_name") or s.get("name") or "" for s in catalog)
+            hint = f"（可用 Skill：{available}）" if available else "（当前无可用 Skill）"
+            return None, f"Skill `{token}` 不存在或未启用。{hint}"
+
+        return matched[0].get("skill_name") or token, args
 
     def _extract_activated_skills(
         self,
@@ -932,13 +1028,16 @@ class AgentService:
             tools=tool_defs,
             tool_executor=tool_executor,
             max_steps=int(skill_context.get("max_steps") or 10),
+            hook_registry=self._hook_registry,
         )
         result = await main_agent.chat(
             "",
             history=[],
             available_skills_catalog=available_skills_catalog,
             activated_skills=skill_context.get("activated_skills") or None,
-            memory_context="",
+            principle="",
+            long_term_context="",
+            short_term_context="",
             run_id=run["id"],
             cancellation_checker=lambda: self._is_run_cancelled(run["id"]),
             cancellation_waiter=lambda: self._wait_for_run_cancelled(run["id"]),
@@ -1262,18 +1361,46 @@ class AgentService:
         return rows[0] if rows else None
 
     def _build_history(self, session_id: str) -> list[ChatMessage]:
-        messages = self.sessions.list_messages(session_id)
+        """构建消息历史，使用滑动窗口 + 前文摘要（Spec FR-013）。"""
+        recent_messages, older_summary = self.sessions.get_context_for_llm(session_id, recent_n=10)
         history: list[ChatMessage] = []
-        for item in messages[-10:]:
+        if older_summary:
+            history.append(ChatMessage(role="system", content=f"[历史对话摘要]\n{older_summary}"))
+        for item in recent_messages:
             if item["role"] not in {"user", "assistant"}:
                 continue
             history.append(ChatMessage(role=item["role"], content=item["content"]))
         return history
 
+    def _ensure_main_run_capacity(self) -> None:
+        """检查当前用户活跃的顶层主 Agent 运行数量是否已达上限。"""
+        running_count = self._db.execute(
+            "SELECT COUNT(*) AS total FROM agent_runs WHERE agent_role = 'main' AND parent_run_id IS NULL AND status = ?",
+            (RunStatus.RUNNING.value,),
+        ).fetchone()
+        if running_count and int(running_count["total"]) >= self._max_parallel_main_runs:
+            raise ValueError(f"当前已有 {self._max_parallel_main_runs} 个主 Agent 并行运行中，请等待完成或取消后再试")
+
     def _should_spawn_sub_agent(self, message: str) -> bool:
         return any(keyword in message for keyword in ["分析", "调研", "比较", "拆解", "汇总"])
 
     async def _run_sub_agent(
+        self,
+        *,
+        parent_run_id: str,
+        session_id: str,
+        goal: str,
+        session_title: str,
+    ) -> dict[str, Any]:
+        async with self._sub_agent_semaphore:
+            return await self._run_sub_agent_inner(
+                parent_run_id=parent_run_id,
+                session_id=session_id,
+                goal=goal,
+                session_title=session_title,
+            )
+
+    async def _run_sub_agent_inner(
         self,
         *,
         parent_run_id: str,
@@ -1588,3 +1715,16 @@ def _dig(data: dict[str, Any], *keys: str) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _staleness_tag(mtime: float | None) -> str:
+    """根据文件修改时间生成时效性标注。"""
+    if mtime is None:
+        return ""
+    import time
+    days = int((time.time() - mtime) / 86400)
+    if days == 0:
+        return " 最后更新: 今天"
+    if days < 30:
+        return f" 最后更新: {days}天前"
+    return f" 最后更新: {days}天前 [可能过时]"

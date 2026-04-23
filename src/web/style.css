@@ -549,16 +549,16 @@ textarea {
 }
 
 .chat-messages {
-    padding: 22px;
+    padding: 12px 16px;
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: 8px;
     overflow-y: auto;
 }
 
 .msg {
     max-width: min(820px, 78%);
-    padding: 15px 18px;
+    padding: 8px 14px;
     border-radius: 20px;
     line-height: 1.6;
     white-space: pre-wrap;
@@ -586,15 +586,15 @@ textarea {
 }
 
 .msg-steps {
-    margin-top: 12px;
-    padding-top: 12px;
+    margin-top: 6px;
+    padding-top: 6px;
     border-top: 1px dashed rgba(31, 42, 48, 0.14);
 }
 
 .step-card {
-    margin-top: 10px;
-    padding: 12px;
-    border-radius: 14px;
+    margin-top: 4px;
+    padding: 6px 10px;
+    border-radius: 10px;
     background: rgba(255, 255, 255, 0.55);
     border: 1px solid rgba(31, 42, 48, 0.08);
 }

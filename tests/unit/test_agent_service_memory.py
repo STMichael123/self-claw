@@ -18,7 +18,12 @@ def db():
 
 @pytest.fixture
 def memory_service(tmp_path, db) -> MemoryService:
-    return MemoryService(data_dir=str(tmp_path / "memory"), db=db)
+    return MemoryService(
+        data_dir=str(tmp_path / "memory"),
+        principle_file=str(tmp_path / "principle.md"),
+        long_term_dir=str(tmp_path / "long-term"),
+        db=db,
+    )
 
 
 @pytest.fixture
@@ -28,12 +33,13 @@ def agent_service(db, memory_service: MemoryService) -> AgentService:
 
 class TestAgentServiceMemory:
     @pytest.mark.asyncio
-    async def test_memory_context_uses_principle_and_session_bound_short_term(
+    async def test_memory_context_injects_long_term_index_and_session_bound_short_term(
         self,
         agent_service: AgentService,
         memory_service: MemoryService,
     ) -> None:
-        memory_service.save_principle("identity", "始终遵守当前会话隔离原则")
+        memory_service.save_principle("始终遵守当前会话隔离原则", operator="test")
+        memory_service.save_long_term("risk-policy", "# 风控策略\n\n交易限额为 100 万", title="风控策略")
         memory_service.save_short_term("session-a", "alpha 只属于 session-a")
         memory_service.save_short_term("session-b", "alpha 只属于 session-b")
 
@@ -43,9 +49,14 @@ class TestAgentServiceMemory:
             base_snapshot="摘要 A",
         )
 
-        assert "当前会话隔离原则" in context
+        assert "风控策略" in context
         assert "alpha 只属于 session-a" in context
         assert "alpha 只属于 session-b" not in context
+
+    def test_principle_loaded_as_full_text(self, agent_service: AgentService, memory_service: MemoryService) -> None:
+        memory_service.save_principle("我是全局约束文档", operator="test")
+        text = memory_service.load_principle()
+        assert "我是全局约束文档" in text
 
     @pytest.mark.asyncio
     async def test_memory_search_can_limit_short_term_and_vectors_by_session(

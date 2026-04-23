@@ -7,6 +7,7 @@ import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -23,9 +24,24 @@ AGENT_TITLE_PATTERN = re.compile(r"^Agent (\d+)$")
 class SessionManager:
     """管理多轮对话的会话生命周期与上下文。"""
 
-    def __init__(self, db: sqlite3.Connection, *, timeout_min: int = DEFAULT_SESSION_TIMEOUT_MIN) -> None:
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        *,
+        timeout_min: int = DEFAULT_SESSION_TIMEOUT_MIN,
+        llm: Any | None = None,
+        model_name: str = "gpt-4o",
+        archives_dir: str = "data/memory/archives",
+    ) -> None:
         self._db = db
         self._timeout = timedelta(minutes=timeout_min)
+        self._llm = llm
+        self._model_name = model_name
+        self._archives_dir = Path(archives_dir)
+
+    def set_llm(self, llm: Any) -> None:
+        """注入 LLM 适配器用于上下文摘要生成。"""
+        self._llm = llm
 
     def create_session(self, user_id: str, *, title: str | None = None, channel_type: str = "web") -> str:
         """创建新会话。"""
@@ -177,7 +193,7 @@ class SessionManager:
         return count
 
     def archive_session(self, session_id: str, *, summary: str = "") -> None:
-        """归档会话（将摘要写入记录）。"""
+        """归档会话（将摘要写入记录 + 导出 JSONL 归档文件）。"""
         now = _utcnow()
         final_summary = summary.strip() or self.generate_summary(session_id)
         self._db.execute(
@@ -187,6 +203,9 @@ class SessionManager:
         )
         self._db.commit()
         logger.info("session_archived", session_id=session_id)
+
+        # FR-013: 导出 JSONL 归档文件
+        self._export_jsonl_archive(session_id)
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         """获取会话详情。"""
@@ -251,22 +270,128 @@ class SessionManager:
             preview.append(f"{role}:{item['content'][:30]}")
         return " | ".join(preview)
 
+    def get_context_for_llm(self, session_id: str, *, recent_n: int = 10) -> tuple[list[dict[str, Any]], str]:
+        """获取滑动窗口上下文：最近 N 条原始消息 + 历史摘要。
+
+        Spec FR-013: 保留最近 N 条原始消息 + 历史消息的 LLM 摘要。
+
+        Returns:
+            (recent_messages, summary_of_older)
+        """
+        all_rows = self._db.execute(
+            "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+            (session_id,),
+        ).fetchall()
+        if len(all_rows) <= recent_n:
+            messages = [dict(r) for r in all_rows]
+            return messages, ""
+
+        older_rows = all_rows[:-recent_n]
+        recent_rows = all_rows[-recent_n:]
+
+        session = self.get_session(session_id)
+        summary = (session.get("context_snapshot") or "") if session else ""
+
+        if not summary or "[历史摘要]" not in summary:
+            summary = self._summarize_older_messages(session_id, older_rows)
+
+        older_summary = ""
+        if "[历史摘要]" in summary:
+            parts = summary.split("[最近消息]")
+            for part in parts:
+                if part.strip().startswith("[历史摘要]"):
+                    older_summary = part.replace("[历史摘要]", "").strip()
+                    break
+        if not older_summary:
+            older_summary = "\n".join(f"{r['role']}: {r['content'][:150]}" for r in older_rows[-20:])[:500]
+
+        return [dict(r) for r in recent_rows], older_summary
+
     def _refresh_context_snapshot(self, session_id: str) -> None:
-        """当消息较多时生成轻量上下文快照。"""
+        """当累计 token 超过模型窗口 80% 时触发压缩（FR-010）。
+
+        压缩前记录 token 使用量与触发阈值。
+        策略：保留最近 N 条原始消息 + 历史消息的 LLM 摘要。
+        """
+        from src.models.router import count_tokens, max_context_tokens
+
         rows = self._db.execute(
             "SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,),
         ).fetchall()
-        if len(rows) < 12:
+        if len(rows) < 4:
             return
 
-        tail = rows[-8:]
-        snapshot = "\n".join(f"{row['role']}: {row['content'][:120]}" for row in tail)
+        all_text = "\n".join(row["content"] for row in rows)
+        total_tokens = count_tokens(all_text, model=self._model_name)
+        window = max_context_tokens(self._model_name)
+        threshold = int(window * 0.8)
+
+        if total_tokens < threshold:
+            return
+
+        logger.info(
+            "context_compression_triggered",
+            session_id=session_id,
+            total_tokens=total_tokens,
+            threshold=threshold,
+            window=window,
+        )
+
+        # 从最新消息往前保留，直到消息数 >= 8 或保留 token < 阈值的 40%
+        recent_count = max(8, len(rows) // 3)
+        recent_count = min(recent_count, len(rows) - 2)
+        older_rows = rows[:-recent_count]
+        recent_rows = rows[-recent_count:]
+
+        older_summary = self._summarize_older_messages(session_id, older_rows)
+
+        recent_text = "\n".join(f"{row['role']}: {row['content'][:200]}" for row in recent_rows)
+        snapshot = ""
+        if older_summary:
+            snapshot += f"[历史摘要]\n{older_summary}\n\n"
+        snapshot += f"[最近消息]\n{recent_text}"
+
         self._db.execute(
             "UPDATE sessions SET context_snapshot = ? WHERE id = ?",
             (snapshot, session_id),
         )
         self._db.commit()
+        logger.info("context_snapshot_refreshed", session_id=session_id, older_count=len(older_rows), recent_count=recent_count)
+
+    def _summarize_older_messages(self, session_id: str, older_rows: list[sqlite3.Row]) -> str:
+        """对历史消息生成摘要。优先使用 LLM，降级为拼接截断。"""
+        if not older_rows:
+            return ""
+
+        older_text = "\n".join(f"{row['role']}: {row['content'][:150]}" for row in older_rows[-20:])
+
+        if self._llm is None:
+            logger.debug("context_summary_no_llm_fallback", session_id=session_id)
+            return older_text[:500]
+
+        try:
+            import asyncio
+            from src.models.llm import ChatMessage
+
+            coro = self._llm.chat(
+                [
+                    ChatMessage(role="system", content="请用简洁的中文摘要以下对话历史，保留关键决策、结论和待办事项。不超过 200 字。"),
+                    ChatMessage(role="user", content=older_text),
+                ],
+                temperature=0.3,
+            )
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                logger.debug("context_summary_async_skip", session_id=session_id)
+                return older_text[:500]
+            response = loop.run_until_complete(coro)
+            summary = response.content.strip()
+            logger.info("context_summary_generated", session_id=session_id, length=len(summary))
+            return summary
+        except Exception as exc:
+            logger.warning("context_summary_failed", session_id=session_id, error=str(exc))
+            return older_text[:500]
 
     def _next_session_title(self, user_id: str) -> str:
         rows = self._db.execute(
@@ -288,6 +413,36 @@ class SessionManager:
         item["message_count"] = int(item.get("message_count") or 0)
         item["active_child_runs"] = int(item.get("active_child_runs") or 0)
         return item
+
+    def _export_jsonl_archive(self, session_id: str) -> None:
+        """将会话全部消息导出为 JSONL 文件（FR-013）。
+
+        路径: data/memory/archives/<session_id>.jsonl
+        每行: {role, content, timestamp, tool_calls?, metadata?}
+        """
+        rows = self._db.execute(
+            "SELECT role, content, created_at, metadata FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+            (session_id,),
+        ).fetchall()
+        if not rows:
+            return
+
+        self._archives_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = self._archives_dir / f"{session_id}.jsonl"
+
+        with open(archive_path, "w", encoding="utf-8") as f:
+            for row in rows:
+                record: dict[str, Any] = {
+                    "role": row["role"],
+                    "content": row["content"],
+                    "timestamp": row["created_at"],
+                }
+                metadata = _from_json(row.get("metadata"), default=None)
+                if metadata:
+                    record["metadata"] = metadata
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        logger.info("session_jsonl_archived", session_id=session_id, path=str(archive_path), lines=len(rows))
 
 
 def _utcnow() -> str:

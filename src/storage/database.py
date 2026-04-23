@@ -96,58 +96,6 @@ CREATE TABLE IF NOT EXISTS vector_records (
     created_at   TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS skills (
-    id             TEXT PRIMARY KEY,
-    name           TEXT NOT NULL UNIQUE,
-    display_name   TEXT,
-    scenario       TEXT,
-    version        TEXT NOT NULL DEFAULT 'v1',
-    status         TEXT NOT NULL DEFAULT 'enabled',
-    sop_source     TEXT,
-    skill_prompt   TEXT,
-    allowed_tools  TEXT,
-    input_schema   TEXT,
-    output_schema  TEXT,
-    examples       TEXT,
-    max_steps      INTEGER,
-    created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS skill_versions (
-    id               TEXT PRIMARY KEY,
-    skill_id         TEXT NOT NULL,
-    version          TEXT NOT NULL,
-    change_note      TEXT,
-    content_snapshot TEXT,
-    created_at       TEXT NOT NULL,
-    FOREIGN KEY (skill_id) REFERENCES skills(id)
-);
-
-CREATE TABLE IF NOT EXISTS skill_drafts (
-    id                TEXT PRIMARY KEY,
-    source_run_id     TEXT,
-    source_session_id TEXT,
-    requested_action  TEXT NOT NULL DEFAULT 'create',
-    target_skill_name TEXT,
-    proposed_name     TEXT,
-    draft_skill_md    TEXT,
-    draft_resources_manifest TEXT,
-    review_note       TEXT,
-    user_intent_summary TEXT,
-    suggested_name    TEXT,
-    skill_prompt      TEXT NOT NULL,
-    allowed_tools     TEXT,
-    input_schema      TEXT,
-    output_schema     TEXT,
-    review_status     TEXT NOT NULL DEFAULT 'draft',
-    reviewer          TEXT,
-    created_at        TEXT NOT NULL,
-    updated_at        TEXT NOT NULL,
-    FOREIGN KEY (source_run_id) REFERENCES agent_runs(id),
-    FOREIGN KEY (source_session_id) REFERENCES sessions(id)
-);
-
 CREATE TABLE IF NOT EXISTS skill_catalog_entries (
     skill_name             TEXT PRIMARY KEY,
     description            TEXT NOT NULL,
@@ -157,19 +105,7 @@ CREATE TABLE IF NOT EXISTS skill_catalog_entries (
     source                 TEXT NOT NULL DEFAULT 'project',
     content_hash           TEXT,
     discovered_at          TEXT NOT NULL,
-    indexed_at             TEXT NOT NULL,
-    last_approved_revision TEXT
-);
-
-CREATE TABLE IF NOT EXISTS skill_revisions (
-    id                         TEXT PRIMARY KEY,
-    skill_name                 TEXT NOT NULL,
-    revision                   TEXT NOT NULL,
-    source_draft_id            TEXT,
-    skill_md_snapshot          TEXT NOT NULL,
-    resources_manifest_snapshot TEXT,
-    content_hash               TEXT,
-    created_at                 TEXT NOT NULL
+    indexed_at             TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agent_runs (
@@ -283,9 +219,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_logs_session_created ON usage_logs(session_
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_memory_documents_tier_key ON memory_documents(tier, key);
 CREATE INDEX IF NOT EXISTS idx_memory_index_scope_session ON memory_index(scope, session_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_vector_records_source ON vector_records(source_type, source_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_skill_drafts_review_updated ON skill_drafts(review_status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_skill_catalog_status_source ON skill_catalog_entries(status, source, indexed_at);
-CREATE INDEX IF NOT EXISTS idx_skill_revisions_name_created ON skill_revisions(skill_name, created_at);
 CREATE INDEX IF NOT EXISTS idx_tool_approvals_status_created ON tool_approvals(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_file_locks_path_expires ON file_locks(sandbox_path, expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_write_lock_path ON file_locks(sandbox_path)
@@ -316,16 +250,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "tasks", "requested_skill_name", "requested_skill_name TEXT")
     _ensure_column(conn, "sessions", "title", "title TEXT")
     _ensure_column(conn, "sessions", "current_run_id", "current_run_id TEXT")
-    _ensure_column(conn, "skills", "display_name", "display_name TEXT")
-    _ensure_column(conn, "skills", "scenario", "scenario TEXT")
     _ensure_column(conn, "agent_runs", "activated_skills", "activated_skills TEXT")
-    _ensure_column(conn, "skill_drafts", "requested_action", "requested_action TEXT DEFAULT 'create'")
-    _ensure_column(conn, "skill_drafts", "target_skill_name", "target_skill_name TEXT")
-    _ensure_column(conn, "skill_drafts", "proposed_name", "proposed_name TEXT")
-    _ensure_column(conn, "skill_drafts", "draft_skill_md", "draft_skill_md TEXT")
-    _ensure_column(conn, "skill_drafts", "draft_resources_manifest", "draft_resources_manifest TEXT")
-    _ensure_column(conn, "skill_drafts", "review_note", "review_note TEXT")
-    _ensure_column(conn, "skill_drafts", "user_intent_summary", "user_intent_summary TEXT")
     conn.commit()
 
 

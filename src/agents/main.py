@@ -26,11 +26,13 @@ class MainAgent:
         tools: dict[str, Any] | None = None,
         tool_executor: Any | None = None,
         max_steps: int = 10,
+        hook_registry: Any | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools or {}
         self.tool_executor = tool_executor
         self.max_steps = max_steps
+        self.hook_registry = hook_registry
         self.sub_executor = SubAgentExecutor(llm, tool_executor=tool_executor)
 
     async def chat(
@@ -40,6 +42,9 @@ class MainAgent:
         history: list[ChatMessage] | None = None,
         available_skills_catalog: list[dict[str, Any]] | None = None,
         activated_skills: list[dict[str, Any]] | None = None,
+        principle: str = "",
+        long_term_context: str = "",
+        short_term_context: str = "",
         memory_context: str = "",
         run_id: str | None = None,
         cancellation_checker: Callable[[], bool] | None = None,
@@ -54,9 +59,11 @@ class MainAgent:
         run_id = run_id or str(uuid.uuid4())
 
         system_prompt = compose_system_prompt(
+            principle=principle,
+            long_term_context=long_term_context,
+            short_term_context=short_term_context or memory_context,
             available_skills_catalog=available_skills_catalog,
             activated_skills=activated_skills,
-            memory_context=memory_context,
         )
 
         messages = build_messages(
@@ -73,6 +80,7 @@ class MainAgent:
             cancellation_checker=cancellation_checker,
             cancellation_waiter=cancellation_waiter,
             approval_requester=approval_requester,
+            hook_registry=self.hook_registry,
         )
 
         return await loop.run(

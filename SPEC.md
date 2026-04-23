@@ -1,8 +1,8 @@
 # Self-Claw 规格说明（唯一事实来源）
 
 状态：生效中
-版本：1.0.1
-最后更新：2026-04-17
+版本：1.2.0
+最后更新：2026-04-21
 负责人：产品 + 工程
 
 ## 1. 目的
@@ -41,7 +41,7 @@
 ### 4.1 范围内（MVP）
 - Agent 核心执行循环（意图理解、规划、执行、观察）。
 - 项目级 Agent Skills 目录发现、激活与运行时执行语义。
-- Skill 草稿自动生成、人工审核、文件化发布与回滚。
+- 基于 `/skill` 斜杠命令的 Skill 创建与文件化发布，以及 Skill 启停管理。
 - 工具注册、发现与调用。
 - 受控文件读写与沙箱工作区。
 - 自然语言任务调度。
@@ -49,7 +49,7 @@
 - 多轮会话与上下文管理。
 - Token/成本使用追踪。
 - 分层混合记忆（Principle + 全局长期 + 会话短期 + 向量数据库）。
-- 基于企业 SOP 的 Skill 沉淀、审核发布、启停与迁移。
+- 基于企业 SOP 的 Skill 沉淀、启停管理。
 - 主 Agent + 子 Agent 协作执行。
 - 同一业务员多个顶层任务线程与多个主 Agent 并行处理。
 - LLM 模型集成与提示词管理。
@@ -78,13 +78,14 @@
 - 提示词编排器（base prompt + principle + available skills catalog + activated skill content + 上下文组合）
 
 3. 能力层
-- Skill 目录发现、catalog 索引、草稿审核、发布、回滚快照与运行时激活服务
+- Skill 目录发现、catalog 索引、启停管理与运行时激活服务
 - 工具注册表与工具调用协调器
 - 调度服务
 - 通知服务（通过渠道抽象层发送，不绑定具体渠道）
 - 分层记忆服务（Principle + long-term + short-term + 向量数据库）
 - 文件工作区服务（沙箱、锁与审计）
 - 成本核算服务
+- Hook/Extension 注册与执行（pre/post 钩子点，从 `.agents/hooks/` 自动发现）
 
 4. 模型集成层
 - LLM 适配器（支持 OpenAI 兼容接口 + Anthropic）
@@ -132,11 +133,17 @@
 系统必须支持 Principle、长期记忆、短期记忆三层结构，并同时提供文件型与向量型检索能力。
 Principle 记忆：
 - Principle 记忆是全局共享的系统级约束文档，类似 identity / soul 文档。
-- Principle 记忆默认注入所有顶层 main Agent，优先级高于长期记忆与短期记忆。
+- Principle 记忆以完整内容注入所有顶层 main Agent 的 system prompt，优先级高于长期记忆与短期记忆。
 - Principle 记忆仅允许通过显式管理入口更新，并产生审计记录。
+- Principle 真相源为项目内 `.agents/principle.md`（单文件，Markdown 格式），用户可直接编辑该文件。
+- 数据库 `MemoryDocument` / `MemoryIndex` 表仅承担索引与缓存职责，不是运行时内容来源。
+- 系统启动时自动检测 `.agents/principle.md` 与索引是否一致，不一致则重建索引。
 长期记忆：
 - 长期记忆是系统全局共享的业务知识层，可由人工沉淀、会话归档摘要或审核通过的 Skill 派生知识写入。
-- 长期记忆存储为可编辑的 Markdown/JSON 文件，支持人工编辑与基础全文检索。
+- 长期记忆真相源为项目内 `.agents/memory/long-term/*.md`（按主题分文件，Markdown 格式），用户可直接编辑文件。
+- 数据库仅承担索引与缓存职责，不作为内容来源。
+- 系统启动时自动检测 `.agents/memory/long-term/` 目录文件与索引是否一致，不一致则重建索引。
+- 注入时仅加载索引摘要（title + snippet），不得默认加载完整文件正文；仅当 Agent 推理步骤命中某条长期记忆且明确需要更多细节时，才允许回源加载该条记忆的完整内容。
 短期记忆：
 - 短期记忆按 session_id 存储为 Markdown 文件，按日归档。
 - 短期记忆仅对所属会话可见，不得被其他顶层会话命中或注入。
@@ -145,8 +152,11 @@ Principle 记忆：
 - 向量记录必须带有 tier 与 session_id/source_id 元数据；短期记忆的向量检索必须按 session_id 过滤。
 - Agent 执行循环中可按层级自动检索相关记忆注入上下文。
 注入顺序：
-- 默认注入顺序为：base prompt -> principle -> long-term -> session snapshot / short-term -> available skills catalog -> activated skill content -> user message。
-- 记忆注入必须优先使用 summary/snippet/检索命中片段等轻量表示；仅当当前推理步骤明确需要更多细节时，才允许回源加载完整记忆正文，且不得默认批量注入完整 long-term 或 short-term 文件内容。
+- 默认注入顺序为：base prompt -> principle（全文） -> long-term（索引摘要） -> session snapshot / short-term -> available skills catalog -> activated skill content -> user message。
+- Principle 以完整内容全局注入，作为所有 Agent 的身份与行为约束基座。
+- 长期记忆仅注入索引摘要（title + snippet），不注入完整文件正文；Agent 可通过记忆检索工具按需回源加载。
+- 短期记忆仅注入所属会话的摘要与近期 snippet，不注入完整历史。
+- 所有记忆注入时必须附带时效性标注，格式为 `最后更新: N天前` 或 `最后更新: 今天`；超过 30 天未更新的记忆条目须标注 `[可能过时]`，提示 Agent 验证后再使用。
 验收标准：
 - 所有顶层 main Agent 都能看到最新 Principle 记忆。
 - 不同会话的 short-term 记忆互不共享。
@@ -162,9 +172,9 @@ Principle 记忆：
 - 顶层会话入口页以气泡卡片/节点形式展示现有顶层会话，每个气泡代表一个顶层任务线程（可显示默认名称如 `Agent 1` 或线程标题）。
 - 顶层会话入口页右侧必须提供明显的“+”气泡/卡片入口，用于新建顶层会话。
 - 用户点击已有顶层会话气泡后，才进入对应的会话详情/对话页面。
-- 左侧导航必须提供“状态管理”与“Skill 目录/审核”入口，前者用于可视化不同顶层会话以及其主 Agent / 子 Agent 的执行进度，后者用于查看项目级 Skill catalog、待审核草稿与审计信息。
+- 左侧导航必须提供”状态管理”与”Skill 目录”入口，前者用于可视化不同顶层会话以及其主 Agent / 子 Agent 的执行进度，后者用于查看项目级 Skill catalog 与审计信息。
 - Skill 目录页必须展示从项目内 `.agents/skills` 发现到的正式 Skill catalog，最少展示 `name`、`description`、`compatibility`、`status`、`location`、`source` 与 `last_indexed_at`。
-- Web 端不得提供正式 Skill 的手工新建、编辑、删除、启用、停用表单；正式 Skill 内容变更的主入口必须是与主会话 Agent 的自然语言对话，Web 仅承担只读目录、草稿审核与审计视图。
+- Web 端不得提供正式 Skill 的手工新建、编辑、删除、启用、停用表单；正式 Skill 内容变更的主入口必须是通过 `/skill` 斜杠命令与 Agent 对话，Web 仅承担只读目录与审计视图。
 - 聊天页不得再通过下拉框预绑定 `skill_id` 作为主要交互方式；必须改为提示用户通过对话显式请求“创建 Skill / 更新 Skill / 停用 Skill / 从当前流程沉淀 Skill”。
 状态管理页要求：
 - 以线程为第一层级展示顶层会话。
@@ -177,8 +187,7 @@ Principle 记忆：
 - 默认首页不直接显示聊天输入框，而是显示顶层会话气泡入口与“+”新建入口。
 - 点击顶层会话气泡可进入对应会话页，并保留该会话独立上下文。
 - 左侧导航包含“状态管理”与“Skill 目录/审核”，且状态管理页可展示顶层会话 > 主 Agent > 子 Agent 的层级进度。
-- Skill 页面必须展示正式 Skill catalog 与待审核草稿，且不存在“新建 Skill”按钮、正式 Skill 编辑表单或聊天页 Skill 选择器。
-- Skill 草稿的批准/拒绝操作必须可在审核页完成，并写入审计日志。
+- Skill 页面必须展示正式 Skill catalog，且不存在”新建 Skill”按钮、正式 Skill 编辑表单或聊天页 Skill 选择器。
 
 ### FR-007 可扩展消息渠道抽象层
 系统必须提供统一的消息渠道抽象接口，以便后续接入任意社交/IM 平台。
@@ -204,27 +213,27 @@ ChannelAdapter 接口约定：
 - 未配置任何渠道时，系统仅通过 Web API 工作，不报错。
 
 ### FR-008 Skill 生命周期管理
-系统必须支持将企业 SOP 以项目级 Agent Skill 的形式沉淀，并通过“草稿 -> 审核 -> 发布 -> 回滚”的生命周期持续迭代。
+系统必须支持将企业 SOP 以项目级 Agent Skill 的形式沉淀，并提供轻量的创建、启停管理。
 正式 Skill 事实源：
 - 正式 Skill 的单一事实源是项目内 `.agents/skills/<skill-name>/SKILL.md` 及其同目录资源文件。
-- 运行时不得以数据库中的 `skills`/`skill_versions` 记录作为正式 Skill 指令内容的最终来源；数据库仅承担草稿、审核、审计、revision snapshot、catalog cache 与迁移状态的职责。
-- 正式 Skill 的内容格式必须遵循 Agent Skills open standard；Self-Claw 不得再把 `input_schema`、`output_schema`、`max_steps`、`status` 等自定义字段写入正式 `SKILL.md`。
-生命周期规则：
-- 创建、更新、停用、回滚 Skill 的主入口是与顶层 main Agent 的自然语言对话，而不是 Web 表单或直接 API CRUD。
-- 对话意图可直接生成草稿，也可从成功的 AgentRun 自动提取草稿；草稿必须记录 `source_run_id`、`source_session_id` 或人工意图摘要。
-- 草稿批准后，由受控发布流程写入 `.agents/skills` 并刷新 registry；拒绝草稿不得修改任何正式 Skill 文件。
-- 正式 Skill 的启用/停用状态由审核/索引层维护，可抑制 catalog 披露与激活，但不得通过向 `SKILL.md` 添加非标准状态字段实现。
-- 正式 Skill 的版本历史由已批准 revision snapshot 组成；回滚通过把某个已批准 snapshot 重新发布到 `.agents/skills/<skill-name>/` 完成。
+- 数据库 `SkillCatalogEntry` 仅承担 catalog 缓存与启停状态，不是运行时内容来源。
+- 正式 Skill 的内容格式必须遵循 Agent Skills open standard；不得把 `input_schema`、`output_schema`、`max_steps`、`status` 等自定义字段写入正式 `SKILL.md`。
+创建与更新：
+- 创建、更新 Skill 的主入口是通过 `/skill` 斜杠命令激活 create-skill 元技能。
+- create-skill 引导用户确认内容后直接写入 `.agents/skills` 并刷新 registry，无需审核流程。
+- 版本管理由 git 承担，系统不自建 revision snapshot。
+启停管理：
+- Skill 的启用/停用状态由 catalog 缓存层维护，可抑制 catalog 披露与激活。
+- 不得通过向 `SKILL.md` 添加非标准状态字段实现启停。
+- 启停操作产生审计记录。
 Web/API 约束：
-- Web 仅允许查看正式 Skill catalog、待审核草稿、revision 历史、审计与迁移告警，不允许手工编辑正式 Skill 内容。
-- API 不得提供接收“原始正式 Skill 内容”的直接新建/更新 CRUD 接口；正式内容变更必须经过草稿审核或正式 Skill 复审动作。
+- Web 仅允许查看正式 Skill catalog 与审计记录，不允许手工编辑正式 Skill 内容。
+- API 不提供正式 Skill 内容的直接 CRUD 接口。
 验收标准：
 - 系统能从 `.agents/skills` 发现正式 Skill，并构建 catalog。
-- 成功的 AgentRun 或明确的对话指令均可生成 Skill 草稿，并记录来源。
-- Skill 草稿可编辑、可批准、可拒绝，且审核动作写入审计日志。
-- 审批通过的 Skill 草稿会写入 `.agents/skills/<skill-name>/SKILL.md` 与附属资源，并触发 registry reload。
-- 正式 Skill 可通过复审动作启用、停用与回滚；启停会影响 catalog 披露与激活结果。
-- 被拒绝的草稿不会产生正式 Skill 文件变更。
+- `/skill` 命令能引导用户完成 Skill 创建，写入文件后自动 reload registry。
+- 正式 Skill 可通过 API 启用、停用；启停会影响 catalog 披露与激活结果。
+- Skill 创建与启停操作产生审计记录。
 
 ### FR-009 主/子 Agent 上下文隔离
 系统必须支持主 Agent 与子 Agent 的分层协作，以保证任务上下文干净、互不污染。
@@ -255,8 +264,10 @@ Web/API 约束：
 - 每步推理的思考过程、动作选择与观察结果均需记录到执行日志。
 - 支持流式输出模式（用于 Web/消息渠道实时反馈）与阻塞模式（用于定时任务）。
 - 主 Agent 可在循环中决定自行处理或委派子 Agent，路由策略支持 LLM 驱动与规则回退双模式。
-- 主 Agent 路由必须先区分“继续当前任务 / 新建顶层任务 / 取消并重跑”，再进入当前线程内的直接回复、Skill 激活、工具、子 Agent 决策。
+- 主 Agent 路由必须先区分”继续当前任务 / 新建顶层任务 / 取消并重跑”，再进入当前线程内的直接回复、Skill 激活、工具、子 Agent 决策。
 - 同一用户的多个顶层主 Agent 运行可并行存在，但各自上下文、运行状态与资源记账必须隔离。
+- 当单步推理输出多个工具调用时，系统按 `concurrency_safe` 标记分组：标记为 true 的工具可并行执行，false 的必须串行执行。
+- 上下文压缩阈值采用 token 计量：当累计 token 数达到模型上下文窗口的 80% 时，系统必须主动触发上下文压缩（保留最近 N 条原始消息 + 历史摘要），而不是等到溢出后才被动截断。压缩前必须向日志记录当前 token 使用量与触发阈值。
 
 ### FR-011 Agent Skills 运行时定义
 系统必须基于 Agent Skills open standard 明确正式 Skill 的目录结构、发现流程与运行时激活语义。
@@ -278,7 +289,7 @@ Web/API 约束：
 验收标准：
 - 系统能严格校验 `SKILL.md` 必填字段与支持字段；不合规 Skill 不得进入 catalog。
 - 启动阶段仅加载 catalog 元数据，不预读完整正文。
-- Draft Skill 未审批前不得被 Agent 作为可执行 Skill 载入。
+- 未启用的 Skill 不得被 Agent 作为可执行 Skill 载入。
 - Skill 被命中后才加载完整正文，并可按需解析相对资源路径。
 - `allowed-tools` 不得扩大既有工具权限，受保护目录规则始终优先。
 
@@ -292,6 +303,7 @@ Web/API 约束：
 - returns: object（JSON Schema）— 返回值定义。
 - requires_approval: bool — 是否需要人工审批后执行（默认 false）。
 - timeout_sec: int — 执行超时时间。
+- concurrency_safe: bool — 标记该工具是否支持在同一 AgentRun 中并行调用（默认 false）。非并发安全工具在同一循环步骤内必须串行执行；文件写入、数据库写入等有副作用的工具应标记为 false。
 工具分类：
 - 内置工具：web_fetch（网页抓取）、web_search（搜索）、exec（命令执行，MVP 阶段仅限白名单命令）、list_dir（目录列表）、read_file（文件读取）、write_file（文件写入）、patch_file（补丁写入）、activate_skill（按名称激活已发现 Skill）。
 - 自定义工具：通过 Python 函数 + 装饰器注册，运行时自动发现。
@@ -322,10 +334,15 @@ Web/API 约束：
 - 同一用户可同时拥有多个 active 会话，每个会话围绕单一业务目标组织上下文。
 - Principle 与 long-term 是全局共享层；short-term、context_snapshot 与 pending tool state 是会话私有层。
 会话生命周期：
-- 创建：用户首次发送消息、显式点击“新建任务”或 API 指定新任务模式时自动生成会话。
+- 创建：用户首次发送消息、显式点击”新建任务”或 API 指定新任务模式时自动生成会话。
 - 活跃：持续接收消息，按消息时间戳更新 last_active_at。
 - 过期：超过可配置的空闲超时（默认 30 分钟）后自动标记为 expired。
-- 归档：过期会话的上下文摘要写入全局 long-term 记忆，原始 short-term 消息保留到文件存档。
+- 归档：过期会话的上下文摘要写入全局 long-term 记忆，原始 short-term 消息导出为 JSONL 格式存档文件。
+消息归档格式：
+- 归档文件路径：`data/memory/archives/<session_id>.jsonl`。
+- 每行一条 JSON 记录，字段包含：`role`、`content`、`timestamp`、`tool_calls`（如有）、`metadata`（如有）。
+- JSONL 格式便于按行解析、流式读取与外部工具集成，不依赖完整文件加载。
+- 归档文件为追加写入，归档完成后不再修改。
 上下文管理：
 - 上下文窗口由模型 max_tokens 决定，系统保留 20% 给输出。
 - 当消息历史超出窗口时，自动执行压缩：保留最近 N 条原始消息 + 历史消息的 LLM 摘要。
@@ -355,12 +372,64 @@ Web/API 约束：
 - Web UI / API 至少可查询线程列表、当前主 Agent 状态、关联子 Agent 数量或运行摘要。
 - 顶层会话入口页能够同时展示多个顶层会话气泡，并明确标识当前选中的会话。
 
+### FR-016 Hook/Extension 机制
+系统必须提供轻量的 Hook 扩展点，允许用户在不修改核心代码的情况下注入自定义行为。
+Hook 注册方式：
+- Hook 以 Python 函数形式定义在 `.agents/hooks/` 目录下，文件名约定为 `<hook_name>.py`。
+- 系统启动时自动扫描 `.agents/hooks/` 并注册所有合法 Hook 函数。
+- 每个 Hook 函数签名必须接受 `context: dict` 参数，返回 `dict`（可修改 context 中的字段）。
+Hook 点定义：
+- `pre_tool_call`：工具调用前触发，context 包含 tool_name、parameters、agent_run_id；返回的 context 中可追加 `abort: true` 以阻止调用。
+- `post_tool_call`：工具调用后触发，context 包含 tool_name、parameters、result、duration_ms、agent_run_id；可用于日志增强、结果校验或副作用处理。
+- `pre_agent_loop_step`：Agent 循环每步执行前触发，context 包含 step_number、activated_skills、session_id。
+- `post_agent_loop_step`：Agent 循环每步执行后触发，context 包含 step_number、action_type、observation_summary。
+- `on_session_archive`：会话归档时触发，context 包含 session_id、summary、message_count。
+安全约束：
+- Hook 函数执行超时时间为 5 秒，超时则跳过该 Hook 并记录警告日志。
+- Hook 函数不得修改全局状态或绕过工具权限边界。
+- Hook 执行失败不影响主流程，仅记录错误日志。
+验收标准：
+- 在 `.agents/hooks/` 中放置合法 Hook 文件后，系统启动时自动加载。
+- `pre_tool_call` Hook 可成功阻止或放行工具调用。
+- `post_tool_call` Hook 可读取工具调用结果。
+- Hook 执行异常不影响 Agent 主循环。
+
+### FR-015 斜杠命令调用 Skill
+系统必须在对话入口支持斜杠命令直接激活并执行 Skill，提供类似编程助手的使用体验。
+斜杠命令语法：
+- `/skill-name` — 激活并执行名为 skill-name 的 Skill。
+- `/skill-name 参数文本` — 激活 Skill，并将参数文本作为该 Skill 的首次输入。
+- `/skill` 或 `/skill create` — 激活 create-skill 元技能，用于创建新 Skill。
+- 斜杠命令后的文本如果为空，则 Skill 以无初始参数模式启动。
+解析规则：
+- 斜杠命令解析发生在 Agent 推理循环之前，属于前端路由层预处理。
+- 当消息以 `/` 开头时，系统提取第一个 `/` 后、空格前的 token 作为 skill-name。
+- skill-name 必须是已发现且状态为 enabled 的正式 Skill；不存在或已禁用的 skill-name 返回 `SKILL_NOT_FOUND` 错误提示。
+- `/` 后的首 token 为 `skill` 时，始终路由到 create-skill 元技能。
+- 非 `/` 开头的消息不触发斜杠命令解析，走正常对话流程。
+create-skill 元技能：
+- 系统必须预装 `.agents/skills/create-skill/SKILL.md` 作为元技能。
+- create-skill 负责引导用户通过自然语言对话完成 Skill 创建。
+- create-skill 引导用户确认内容后直接写入 `.agents/skills/<name>/SKILL.md` 并调用 reload registry。
+- create-skill 的 `allowed-tools` 包含 web_fetch 等辅助工具，不包含通用文件写入。
+验收标准：
+- 用户在对话框输入 `/skill-name` 后，系统自动激活对应 Skill 并进入执行。
+- 输入 `/skill` 后系统激活 create-skill 元技能，引导用户创建新 Skill。
+- 输入 `/nonexistent` 后系统返回明确的错误提示。
+- 非 `/` 开头的普通消息不受影响。
+- create-skill 能成功引导用户生成 Skill 并写入文件。
+
 ## 7. 非功能需求
 每条需求拥有稳定编号：NFR-xxx。
 
 ### NFR-001 可靠性
 - 单个任务失败时，调度器应持续运行。
 - 服务重启后可恢复已持久化任务。
+- LLM 调用必须实现分类重试策略：
+  - 可重试错误（UPSTREAM_MODEL_ERROR、RATE_LIMITED、EMBEDDING_FAILED）：使用指数退避重试，最多 3 次，基础间隔 1s，最大间隔 30s。
+  - 不可重试错误（SCHEMA_VALIDATION_FAILED、TOOL_NOT_ALLOWED、FILE_SANDBOX_VIOLATION 等）：立即失败并返回错误码，不消耗重试额度。
+  - 重试事件必须记录到日志（包含重试次数、累计等待时间与最终状态）。
+  - 连续可重试错误超过阈值（默认 5 次/分钟）时触发熔断，返回 MODEL_FALLBACK 或降级到备用模型。
 
 ### NFR-002 可观测性
 - 结构化日志并包含关联 ID。
@@ -379,8 +448,8 @@ Web/API 约束：
 - 密钥通过环境变量或安全密钥源存储。
 - 消息渠道回调必须通过 ChannelAdapter.verify_callback 校验。
 - 通用文件读写工具只能访问单一配置化业务沙箱根目录，越界路径与符号链接必须拒绝。
-- `.agents/skills` 是项目级受保护控制目录，不得通过通用文件工具直接读写；正式 Skill 访问必须走 Skill registry / activate_skill，正式 Skill 发布必须走专门的审核发布流程。
-- Principle 记忆更新、自动生成 Skill 草稿的批准/拒绝、正式 Skill 发布/启停/回滚，以及写文件审批必须产生审计记录。
+- `.agents/skills` 是项目级受保护控制目录，不得通过通用文件工具直接读写；正式 Skill 访问必须走 Skill registry / activate_skill。
+- Principle 记忆更新、Skill 创建/启停、写文件审批必须产生审计记录。
 
 ### NFR-006 并发与限流
 - 同一用户同时活跃的顶层主 Agent 运行数量可配置（默认最大 3 个并行）。
@@ -401,9 +470,7 @@ Web/API 约束：
 - MemoryDocument：id, tier(principle|long_term), key, title, content, format(markdown|json), version, source_type(manual|session_archive|approved_skill_revision), source_ref, created_at, updated_at
 - MemoryIndex：id, scope(principle|short_term|long_term), session_id(可为空), ref_path, summary, embedding_id(可为空,关联向量记录), updated_at
 - VectorRecord：id, content_hash, text_chunk, embedding(vector), source_type(session_summary|task_result|skill_output|long_term_memory|principle_memory), source_id, created_at
-- SkillCatalogEntry：skill_name, description, location, compatibility(可为空), status(enabled|disabled), source(project|legacy_migration), content_hash, discovered_at, indexed_at, last_approved_revision(可为空)
-- SkillDraft：id, source_run_id(可为空), source_session_id(可为空), requested_action(create|update|disable|rollback), target_skill_name(可为空), proposed_name(可为空), draft_skill_md, draft_resources_manifest, review_status(draft|approved|rejected), reviewer, review_note, created_at, updated_at
-- SkillRevision：id, skill_name, revision, source_draft_id(可为空), skill_md_snapshot, resources_manifest_snapshot, content_hash, created_at
+- SkillCatalogEntry：skill_name, description, location, compatibility(可为空), status(enabled|disabled), source(project), content_hash, discovered_at, indexed_at
 - AgentRun：id, parent_run_id(顶层 main run 为空), agent_role(main|sub), activated_skills(json array,可为空), session_id, task_ref, context_ref, result_ref, started_at, ended_at, status, steps_count
 - ToolCall：id, agent_run_id, tool_name, parameters, result, duration_ms, status, created_at
 - FileLock：id, sandbox_path, lock_type(read|write), owner_run_id, created_at, expires_at
@@ -414,28 +481,27 @@ Web/API 约束：
 语义约束：
 - Session 表示业务员可见的顶层任务线程。
 - AgentRun 中 `agent_role=main` 且 `parent_run_id` 为空的记录表示顶层主 Agent 运行。
-- `.agents/skills` 中的文件是正式 Skill 内容的唯一事实源；`SkillCatalogEntry` 与 `SkillRevision` 仅承担索引/快照职责，不是运行时最终内容来源。
-- `SkillDraft` 是审核工件，不得直接进入正式执行路径。
+- `.agents/skills` 中的文件是正式 Skill 内容的唯一事实源；`SkillCatalogEntry` 仅承担 catalog 缓存与启停状态，不是运行时内容来源。
+- Skill 版本管理由 git 承担，系统不自建 revision snapshot。
 
 ## 9. API 与接口约定（初版）
 - 内部服务通过明确的服务接口通信。
 - Web API 从 /api/v1 开始版本化。
 - 破坏性 API 变更必须提升规格主版本号。
 
-### 9.1 Skill 目录与审核 API（对应 FR-008）
+### 9.1 Skill 目录与管理 API（对应 FR-008）
 基础路径：`/api/v1/skills`
 
 1. 查询已发现 Skill catalog
 - 方法与路径：GET `/api/v1/skills`
 - 查询参数：
   - status: enabled|disabled（可选）
-  - source: project|legacy_migration（可选）
   - keyword: string（可选）
-- 响应体最少字段：skill_name, description, compatibility(可为空), status, location, source, last_indexed_at
+- 响应体最少字段：skill_name, description, compatibility(可为空), status, location, last_indexed_at
 
 2. 查询单个 Skill 详情
 - 方法与路径：GET `/api/v1/skills/{skill_name}`
-- 响应体最少字段：skill_name, frontmatter, location, resource_manifest, status, latest_revision, recent_audit
+- 响应体最少字段：skill_name, frontmatter, location, resource_manifest, status, recent_audit
 
 3. 刷新 Skill registry
 - 方法与路径：POST `/api/v1/skills/reload`
@@ -445,68 +511,22 @@ Web/API 约束：
   - invalid_count: int
   - warnings: string[]
 
-4. 生成 Skill 草稿
-- 方法与路径：POST `/api/v1/skills/drafts`
-- 请求体：
-  - source_run_id: string（可选）
-  - source_session_id: string（可选）
-  - requested_action: create|update|disable|rollback
-  - target_skill_name: string（可选）
-  - proposed_name: string（可选）
-  - operator: string
-  - user_intent_summary: string（可选）
-- 响应体：
-  - draft_id: string
-  - review_status: draft
-  - requested_action: string
-
-5. 查询与编辑 Skill 草稿
-- 方法与路径：GET `/api/v1/skills/drafts`
-- 查询参数：
-  - review_status: draft|approved|rejected（可选）
-  - requested_action: create|update|disable|rollback（可选）
-  - target_skill_name: string（可选）
-- 方法与路径：GET `/api/v1/skills/drafts/{draft_id}`
-- 方法与路径：PATCH `/api/v1/skills/drafts/{draft_id}`
-
-6. 审核 Skill 草稿
-- 方法与路径：POST `/api/v1/skills/drafts/{draft_id}/approve`
-- 请求体：
-  - operator: string
-  - change_note: string（可选）
-- 响应体：
-  - draft_id: string
-  - skill_name: string
-  - published_revision: string
-  - registry_reloaded: bool
-- 方法与路径：POST `/api/v1/skills/drafts/{draft_id}/reject`
-
-7. 正式 Skill 复审动作
+4. Skill 启停动作
 - 方法与路径：POST `/api/v1/skills/{skill_name}/actions`
 - 请求体：
-  - action: enable|disable|rollback
-  - target_revision: string（仅 rollback 时必填）
+  - action: enable|disable
   - operator: string
   - reason: string（可选）
 - 响应体：
   - skill_name: string
   - action: string
   - status: string
-  - active_revision: string
 
-8. Skill 审计与迁移查询
+5. Skill 审计查询
 - 方法与路径：GET `/api/v1/skills/audit`
 - 查询参数：
   - skill_name: string（可选）
   - action: string（可选）
-  - draft_id: string（可选）
-- 方法与路径：GET `/api/v1/skills/migrations`
-
-9. 正式 Skill 变更约束
-- API 不得提供接收“原始正式 Skill 内容”的直接新建/更新/删除 CRUD 接口。
-- 正式 Skill 内容变更只能来自草稿批准或正式 Skill 复审动作。
-- 每次正式发布、启停、回滚必须产生审计记录。
-- 每次 Skill 草稿生成、编辑、批准、拒绝必须产生审计记录。
 - 审计记录最少字段：operator, action, skill_name, revision, timestamp, diff_summary。
 
 ### 9.2 主/子 Agent 协作协议（对应 FR-009）
@@ -546,13 +566,11 @@ Web/API 约束：
 - `SKILL_VALIDATION_FAILED`: `SKILL.md` 格式非法、缺少必填字段或包含不支持字段，禁止自动重试。
 - `SKILL_ACTIVATION_FAILED`: Skill 激活失败或加载 `SKILL.md` / 资源失败，允许在 registry reload 后重试一次。
 - `SKILL_RESOURCE_ACCESS_DENIED`: 访问未激活 Skill 资源或越过当前 Skill 根目录，禁止自动重试。
-- `LEGACY_SKILL_MIGRATION_REQUIRED`: 旧数据库中心化 Skill 尚未完成迁移审核，禁止执行。
 - `SCHEMA_VALIDATION_FAILED`: API、工具或子 Agent 的结构化输入/输出不符合 schema，禁止自动重试。
 - `SUBAGENT_TIMEOUT`: 子 Agent 超时，允许最多 2 次指数退避重试。
 - `TOOL_EXECUTION_FAILED`: 工具执行失败，允许按策略重试。
 - `TOOL_NOT_ALLOWED`: 工具被当前全局策略、父子 Agent 工具上界或受保护目录规则拒绝，禁止重试。
 - `TOOL_APPROVAL_PENDING`: 工具需人工审批，循环暂停等待。
-- `SKILL_DRAFT_REVIEW_REQUIRED`: 自动生成的 Skill 草稿尚未通过人工审核，禁止执行。
 - `UPSTREAM_MODEL_ERROR`: 模型上游错误，允许重试并记录熔断计数。
 - `MODEL_FALLBACK`: 主模型降级到备用模型，记录但不阻断。
 - `CONTEXT_OVERFLOW`: 上下文超窗口限制，触发压缩后重试一次。
@@ -570,14 +588,14 @@ Web/API 约束：
 ### 9.4 接口验收检查
 - FR-005 验收必须覆盖：Principle / long-term / short-term 三层记忆、全文检索、向量语义检索、索引重建、向量写入降级。
 - FR-007 验收必须覆盖：ChannelAdapter 接口完整性、TestChannelAdapter 全流程、渠道动态加载、无渠道时仅 Web 可用。
-- FR-008 验收必须覆盖：`.agents/skills` catalog 发现、Skill 草稿生成与审核、正式 Skill 发布/启停/回滚、迁移告警与审计记录完整性。
+- FR-008 验收必须覆盖：`.agents/skills` catalog 发现、`/skill` 斜杠命令创建 Skill、启停操作与审计记录完整性。
 - FR-009 验收必须覆盖：上下文隔离、结构化回传、独立成本与日志记录。
 - FR-010 验收必须覆盖：完整循环流转、最大步数限制、流式输出。
-- FR-011 验收必须覆盖：严格 `SKILL.md` 校验、catalog 披露、Skill 激活、相对资源解析、Draft Skill 不可执行、`allowed-tools` 不扩大权限。
+- FR-011 验收必须覆盖：严格 `SKILL.md` 校验、catalog 披露、Skill 激活、相对资源解析、未启用 Skill 不可执行、`allowed-tools` 不扩大权限。
 - FR-012 验收必须覆盖：工具注册发现、`activate_skill`、参数校验、超时处理、审批流、业务沙箱与受保护 Skill 目录边界。
 - FR-013 验收必须覆盖：会话创建与过期、上下文压缩、归档后检索、short-term 会话隔离。
 - FR-014 验收必须覆盖：同一用户多顶层任务并行、新任务不污染旧任务、原线程内重跑、共享 Principle/long-term 与隔离 short-term、状态可见性。
-- FR-006 验收必须覆盖：首页会话气泡入口、“+”新建会话入口、点击气泡进入会话页、状态管理页展示主/子 Agent 进度、Skill 目录/审核页只读化。
+- FR-006 验收必须覆盖：首页会话气泡入口、”+”新建会话入口、点击气泡进入会话页、状态管理页展示主/子 Agent 进度、Skill 目录页只读化。
 
 ### 9.5 Agent 执行 API（对应 FR-010）
 1. 发送消息并触发 Agent 执行
@@ -702,7 +720,7 @@ Web/API 约束：
 ### 9.9 记忆管理 API（对应 FR-005 / FR-013）
 1. 查询 Principle 记忆
 - 方法与路径：GET `/api/v1/memory/principle`
-- 响应体：当前 Principle 文档列表或聚合内容。
+- 响应体：读取 `.agents/principle.md` 文件内容。
 
 2. 更新 Principle 记忆
 - 方法与路径：PUT `/api/v1/memory/principle`
@@ -710,10 +728,17 @@ Web/API 约束：
   - content: string
   - change_note: string
   - operator: string
+- 行为：写入 `.agents/principle.md` + 重建 DB 索引 + 写审计日志。
 
 3. 查询与写入 long-term 记忆
 - 方法与路径：GET `/api/v1/memory/long-term`
+- 响应体：列出 `.agents/memory/long-term/` 下所有条目（key, title, snippet）。
 - 方法与路径：POST `/api/v1/memory/long-term`
+- 请求体：
+  - key: string（文件名，小写 kebab-case）
+  - content: string
+  - title: string（可选）
+- 行为：写入 `.agents/memory/long-term/{key}.md` + 重建 DB 索引 + 写审计日志。
 
 4. 分层记忆检索
 - 方法与路径：GET `/api/v1/memory/search`
@@ -773,6 +798,38 @@ Web/API 约束：
 3. 变更记录必须标注 HOTFIX。
 
 ## 14. 规格变更记录
+- 1.2.0（2026-04-21）
+  - NFR-001 新增 LLM 分类重试策略：区分可重试/不可重试错误，指数退避重试，熔断阈值与降级机制。
+  - FR-012 工具描述新增 `concurrency_safe` 标记：标记工具是否支持并行调用，有副作用工具默认 false。
+  - FR-010 Agent 执行循环新增并发工具分组：按 concurrency_safe 分组并行/串行执行。
+  - FR-010 新增上下文压缩 token 阈值：达到模型窗口 80% 时主动压缩，基于 token 计量而非消息条数。
+  - 新增 FR-016 Hook/Extension 机制：pre_tool_call / post_tool_call / pre_agent_loop_step / post_agent_loop_step / on_session_archive 五个扩展点，从 `.agents/hooks/` 自动发现。
+  - Section 17.3 新增配置片段自动合并：`.agents/settings.d/*.json` 按字母序深度合并到主配置。
+  - FR-013 消息归档格式改为 JSONL：归档路径 `data/memory/archives/<session_id>.jsonl`，每行一条 JSON 记录。
+  - Section 5 能力层新增 Hook/Extension 注册与执行。
+  - Section 18 目录结构新增 `.agents/hooks/` 与 `data/memory/archives/`。
+- 1.1.2（2026-04-21）
+  - FR-005 明确 Principle 全文注入 + 长期记忆仅注入索引摘要的分层策略。
+  - 注入顺序描述从笼统的"summary/snippet 优先"改为具体的分层规则：Principle 全文、long-term 仅索引摘要、short-term 仅摘要与 snippet。
+  - 新增记忆时效性标注要求：所有记忆注入附带 `最后更新: N天前`，超过 30 天标注 `[可能过时]`。
+- 1.1.1（2026-04-21）
+  - 全文清理 v1.1.0 精简后遗留的旧流程引用：移除所有对 Skill 草稿、审核、回滚、迁移、revision snapshot 的描述，统一为 `/skill` 斜杠命令 + 文件直写 + 启停管理。
+  - 涉及章节：Section 4.1、Section 5、FR-006、FR-011、FR-015、Section 9.4、Section 19.2、Section 19.3、Section 20.1 测试矩阵、ODR-011。
+- 1.1.0（2026-04-21）
+  - FR-008 精简：移除草稿审核/回滚/迁移流程，Skill 创建改为 `/skill` 直接写入文件 + registry reload，版本管理由 git 承担。
+  - 数据模型移除 SkillDraft、SkillRevision 表，SkillCatalogEntry 移除 last_approved_revision 和 source=legacy_migration 字段。
+  - API 9.1 精简：移除草稿/审核/回滚/迁移端点，保留 catalog + 启停 + 审计。
+  - 错误码移除 LEGACY_SKILL_MIGRATION_REQUIRED 和 SKILL_DRAFT_REVIEW_REQUIRED。
+  - 新增 FR-015：斜杠命令调用 Skill（`/skill-name` 直接激活 Skill，`/skill` 激活 create-skill 元技能）。
+  - FR-008 更新：Skill 创建主入口从自然语言对话改为 `/skill` 斜杠命令。
+  - 新增系统预装元技能 `.agents/skills/create-skill/SKILL.md`。
+  - Section 18 补充 create-skill 目录。
+- 1.0.2（2026-04-21）
+  - FR-005 明确 Principle 与 Long-term 记忆的文件化真相源：Principle 为 `.agents/principle.md`，Long-term 为 `.agents/memory/long-term/*.md`。
+  - 数据库 `MemoryDocument` / `MemoryIndex` 表降级为索引与缓存职责，不作为运行时内容来源。
+  - 系统启动时自动检测文件与索引一致性并按需重建。
+  - Section 18 目录结构补充 `.agents/principle.md` 与 `.agents/memory/long-term/`。
+  - 新增 Section 9.9 记忆管理 API：Principle CRUD 与 Long-term CRUD。
 - 1.0.1（2026-04-17）
   - 将“渐进式披露优先”提升为全局设计原则，明确目录、索引、摘要、snippet 优先，正文与资源按需加载。
   - FR-005 增补记忆注入的轻量披露约束：默认使用 summary/snippet/命中片段，不得批量注入完整记忆正文。
@@ -862,7 +919,7 @@ Web/API 约束：
 - ODR-008：Web 首页信息架构（已解决：默认首页为顶层会话气泡入口页；聊天页为会话详情页；状态管理承担多线程与主/子 Agent 进度可视化，见 FR-006/9.8）。
 - ODR-009：记忆分层语义（已解决：Principle 全局共享、long-term 全局共享、short-term 会话隔离，见 FR-005/FR-013）。
 - ODR-010：文件工具沙箱与项目控制目录边界（已解决：业务文件使用固定单一配置化沙箱目录，`.agents/skills` 作为受保护控制目录单独处理，见 FR-012/NFR-005）。
-- ODR-011：自动生成 Skill 的上线策略（已解决：先生成草稿，再人工审核启用，见 FR-008/FR-011）。
+- ODR-011：自动生成 Skill 的上线策略（已解决：通过 `/skill` 斜杠命令直接创建并启用，见 FR-008/FR-015）。
 - ODR-012：正式 Skill 的存储与格式（已解决：项目内 `.agents/skills` + 严格 Agent Skills，见 FR-008/FR-011）。
 - ODR-013：Skill 激活机制（已解决：先披露 catalog，再通过 `activate_skill` 加载正文与资源，见 FR-011/FR-012）。
 
@@ -884,9 +941,14 @@ Web/API 约束：
 - 错误处理必须返回统一错误码（见 9.3），禁止仅返回裸异常文本。
 
 ### 17.3 配置与密钥
-- 配置分层：默认值、环境变量、部署覆盖。
+- 配置分层：默认值、环境变量、部署覆盖、配置片段自动合并。
 - 密钥仅允许来自环境变量或受控密钥源，不可写入仓库。
 - 配置项新增或变更必须同步更新规格与部署模板。
+- 配置片段自动合并：系统支持 `.agents/settings.d/*.json` 目录下的 JSON 配置片段，启动时自动扫描并按文件名字母序合并到主配置。
+  - 合并规则：深度合并（dict 递归合并，列表替换，标量覆盖）。
+  - 用途：团队可将策略片段（如默认审批规则、允许的模型列表、并发限额等）以独立文件形式管理，无需修改主配置文件。
+  - 冲突处理：后加载的片段覆盖先加载的片段；环境变量始终具有最高优先级。
+  - 无 `.agents/settings.d/` 目录时不影响启动。
 
 ## 18. 目录与模块规范（首版）
 建议目录结构如下（实现时可在不破坏边界前提下微调）：
@@ -897,7 +959,7 @@ Web/API 约束：
 - src/agents/sub：子 Agent 执行器、隔离上下文处理。
 - src/agents/loop：Agent 核心执行循环（ReAct）、步骤管理。
 - src/agents/prompt：提示词编排器、模板组装。
-- src/skills：Skill 目录发现、catalog 索引、草稿审核、发布、回滚快照、运行时激活与迁移。
+- src/skills：Skill 目录发现、catalog 索引、运行时激活。
 - src/tools：工具注册表、内置工具实现、自定义工具加载。
 - src/models：LLM 适配器、模型路由、上下文窗口管理、Token 计数。
 - src/sessions：会话/顶层任务线程生命周期、上下文压缩、归档。
@@ -911,6 +973,15 @@ Web/API 约束：
 - tests/unit：单元测试。
 - tests/integration：集成测试。
 - tests/contracts：契约测试（重点覆盖 FR-008/FR-009/FR-011/FR-012）。
+
+项目级控制目录（`.agents/`）文件结构：
+- `.agents/principle.md`：Principle 记忆真相源（全局约束文档）。
+- `.agents/skills/<skill-name>/SKILL.md`：正式 Skill 真相源。
+- `.agents/skills/create-skill/SKILL.md`：系统预装元技能，用于通过对话创建新 Skill。
+- `.agents/memory/long-term/*.md`：长期记忆真相源（按主题分文件）。
+- `.agents/hooks/<hook_name>.py`：用户自定义 Hook 函数（自动发现并注册）。
+- `data/memory/short_term/<date>/<session_id>.md`：短期会话记忆（按日归档）。
+- `data/memory/archives/<session_id>.jsonl`：已归档会话的完整消息记录（JSONL 格式，追加写入）。
 
 模块边界规则：
 - api 层不得直接访问底层存储，必须通过 services。
@@ -937,13 +1008,13 @@ Web/API 约束：
 - 任务执行总数、成功率、失败率。
 - 顶层主 Agent 活跃数、排队深度、平均执行时长。
 - 子 Agent 平均耗时、超时率。
-- Skill 激活次数、失败率、草稿批准率、发布/回滚次数。
+- Skill 激活次数、失败率。
 - 模型 token 使用量与成本趋势。
 
 ### 19.3 审计事件（强制）
 以下动作必须记录审计：
-- Skill 正式发布、启用、停用、回滚。
-- Skill 草稿生成、编辑、批准、拒绝。
+- Skill 启用、停用。
+- Skill 文件创建。
 - Principle / long-term 记忆的人工更新。
 - 沙箱文件写入、补丁写入、写冲突与人工审批。
 - 主 Agent 调度子 Agent。
@@ -970,15 +1041,13 @@ Web/API 约束：
   - “+”气泡可创建新的顶层会话。
   - 点击已有会话气泡后进入对应会话页，且会话上下文正确切换。
   - 左侧“状态管理”页可展示顶层会话、main Agent 与 sub Agent 的层级进度。
-  - Skill 页面展示只读 catalog 与待审核草稿，且不存在正式 Skill 手工 CRUD 控件与聊天页 Skill 下拉框。
+  - Skill 页面展示只读 catalog，且不存在正式 Skill 手工 CRUD 控件与聊天页 Skill 下拉框。
 - FR-008：
   - `.agents/skills` 中的正式 Skill 可被发现并进入 catalog。
   - 非法 frontmatter 或缺少必填字段的 Skill 会被跳过并产生告警。
-  - 成功的 AgentRun 或明确对话意图可生成 Skill 草稿。
-  - Skill 草稿可编辑、可批准、可拒绝，且审核动作写审计日志。
-  - 审批通过的 Skill 草稿会写入 `.agents/skills/<skill-name>/SKILL.md` 并触发 registry reload。
-  - 停用后的 Skill 不再被披露或激活；回滚会把已批准 revision 重新发布到正式目录。
-  - 旧数据库中心化 Skill 会进入 migration draft / 告警路径，而不是直接进入正式执行。
+  - `/skill` 命令能引导用户完成 Skill 创建并写入文件。
+  - 停用后的 Skill 不再被披露或激活。
+  - Skill 创建与启停操作产生审计记录。
 - FR-009：
   - 子 Agent 只能读取下发 context_pack。
   - 子 Agent 回传必须满足 output_schema。
@@ -992,7 +1061,7 @@ Web/API 约束：
 - FR-011：
   - 启动阶段仅加载 Skill catalog 元数据，不预读完整正文。
   - 命中 Skill 后才激活 `SKILL.md` 正文，并将激活事件记录到运行日志。
-  - Draft Skill 未审批前不得被加载执行。
+  - 未启用的 Skill 不得被加载执行。
   - 资源路径按 Skill 根目录相对解析，且不能越过当前 Skill 根目录。
   - `allowed-tools` 只能预批准已有权限，不能扩大工具能力或绕过受保护目录规则。
 - FR-012：

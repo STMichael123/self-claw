@@ -259,67 +259,50 @@ class TestSkillsAPI:
         assert resp.status_code == 200
         assert resp.json() == []
 
-    def test_create_review_publish_skill_draft(self, client: TestClient) -> None:
-        created = client.post(
-            "/api/v1/skills/drafts",
-            json={
-                "requested_action": "create",
-                "proposed_name": "test-skill",
-                "draft_skill_md": _skill_markdown("test-skill", "测试 Skill", allowed_tools=["web_fetch"]),
-                "operator": "reviewer-a",
-                "user_intent_summary": "将常见网页抓取流程沉淀成 Skill",
-            },
+    def test_skill_file_discovery_and_catalog(self, client: TestClient, tmp_path) -> None:
+        skill_dir = tmp_path / ".agents" / "skills" / "test-skill"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            _skill_markdown("test-skill", "测试 Skill", allowed_tools=["web_fetch"]),
+            encoding="utf-8",
         )
-        assert created.status_code == 200
-        draft_id = created.json()["draft_id"]
 
-        drafts = client.get("/api/v1/skills/drafts")
-        assert drafts.status_code == 200
-        assert any(item["draft_id"] == draft_id for item in drafts.json())
-
-        approved = client.post(
-            f"/api/v1/skills/drafts/{draft_id}/approve",
-            json={"reviewer": "reviewer-a", "note": "looks good"},
-        )
-        assert approved.status_code == 200
-        payload = approved.json()
-        assert payload["skill_name"] == "test-skill"
-        assert payload["status"] == "enabled"
-        assert payload["latest_revision"] == "r1"
+        reload = client.post("/api/v1/skills/reload")
+        assert reload.status_code == 200
 
         listing = client.get("/api/v1/skills")
         assert listing.status_code == 200
-        assert [item["skill_name"] for item in listing.json()] == ["test-skill"]
+        names = [item["skill_name"] for item in listing.json()]
+        assert "test-skill" in names
 
-    def test_skill_detail_contains_frontmatter_and_revisions(self, client: TestClient) -> None:
-        created = client.post(
-            "/api/v1/skills/drafts",
-            json={
-                "requested_action": "create",
-                "proposed_name": "locked-skill",
-                "draft_skill_md": _skill_markdown("locked-skill", "锁定 Skill", allowed_tools=[]),
-                "draft_resources_manifest": [{"path": "references/guide.md", "content": "参考说明"}],
-            },
-        )
-        assert created.status_code == 200
-        draft_id = created.json()["draft_id"]
-        approved = client.post(
-            f"/api/v1/skills/drafts/{draft_id}/approve",
-            json={"reviewer": "reviewer-b", "note": "publish"},
-        )
-        assert approved.status_code == 200
-
-        detail = client.get("/api/v1/skills/locked-skill")
+        detail = client.get("/api/v1/skills/test-skill")
         assert detail.status_code == 200
         payload = detail.json()
-        assert payload["frontmatter"]["name"] == "locked-skill"
-        assert payload["resource_manifest"] == [
-            {"path": "references/guide.md", "kind": "references", "size": len("参考说明".encode("utf-8"))}
-        ]
+        assert payload["frontmatter"]["name"] == "test-skill"
+        assert payload["status"] == "enabled"
 
-        revisions = client.get("/api/v1/skills/locked-skill/revisions")
-        assert revisions.status_code == 200
-        assert revisions.json()[0]["revision"] == "r1"
+    def test_skill_enable_disable(self, client: TestClient, tmp_path) -> None:
+        skill_dir = tmp_path / ".agents" / "skills" / "toggle-skill"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            _skill_markdown("toggle-skill", "开关测试"),
+            encoding="utf-8",
+        )
+        client.post("/api/v1/skills/reload")
+
+        disabled = client.post(
+            "/api/v1/skills/toggle-skill/actions",
+            json={"action": "disable", "operator": "tester", "reason": "测试禁用"},
+        )
+        assert disabled.status_code == 200
+        assert disabled.json()["status"] == "disabled"
+
+        enabled = client.post(
+            "/api/v1/skills/toggle-skill/actions",
+            json={"action": "enable", "operator": "tester", "reason": "测试启用"},
+        )
+        assert enabled.status_code == 200
+        assert enabled.json()["status"] == "enabled"
 
 
 class TestToolsAPI:
@@ -805,7 +788,7 @@ class TestAgentAndStatusAPI:
         assert session.status_code == 200
         assert any(message["content"] == "审批后的最终回复" for message in session.json()["messages"])
 
-    def test_skill_allowlist_blocks_unlisted_tool_execution(self, client: TestClient) -> None:
+    def test_skill_allowlist_blocks_unlisted_tool_execution(self, client: TestClient, tmp_path) -> None:
         llm = ForbiddenToolLLM()
         service = client.app.state.agent_service
         service.model_router.get_primary = lambda: llm  # type: ignore[method-assign]
@@ -823,21 +806,13 @@ class TestAgentAndStatusAPI:
             )
         )
 
-        created = client.post(
-            "/api/v1/skills/drafts",
-            json={
-                "requested_action": "create",
-                "proposed_name": "allowlist-only",
-                "draft_skill_md": _skill_markdown("allowlist-only", "不允许调用任何工具", allowed_tools=[]),
-            },
+        skill_dir = tmp_path / ".agents" / "skills" / "allowlist-only"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            _skill_markdown("allowlist-only", "不允许调用任何工具", allowed_tools=[]),
+            encoding="utf-8",
         )
-        assert created.status_code == 200
-        draft_id = created.json()["draft_id"]
-        approved = client.post(
-            f"/api/v1/skills/drafts/{draft_id}/approve",
-            json={"reviewer": "reviewer-c", "note": "publish"},
-        )
-        assert approved.status_code == 200
+        client.post("/api/v1/skills/reload")
 
         chat = client.post(
             "/api/v1/agent/chat",

@@ -18,35 +18,10 @@ router = APIRouter(prefix="/api/v1")
 
 # ── 请求/响应模型 ───────────────────────────────────────
 
-class CreateSkillDraftRequest(BaseModel):
-    requested_action: Literal["create", "update"]
-    target_skill_name: str | None = None
-    proposed_name: str | None = None
-    draft_skill_md: str | None = None
-    draft_resources_manifest: list[dict[str, Any]] = Field(default_factory=list)
-    source_run_id: str | None = None
-    source_session_id: str | None = None
-    operator: str = DEFAULT_WEB_USER_ID
-    user_intent_summary: str = ""
-
-
-class UpdateSkillDraftRequest(BaseModel):
-    proposed_name: str | None = None
-    draft_skill_md: str | None = None
-    draft_resources_manifest: list[dict[str, Any]] | None = None
-    user_intent_summary: str | None = None
-
-
-class ReviewSkillDraftRequest(BaseModel):
-    reviewer: str = DEFAULT_WEB_USER_ID
-    note: str = ""
-
-
 class SkillActionRequest(BaseModel):
-    action: Literal["enable", "disable", "rollback"]
+    action: Literal["enable", "disable"]
     operator: str = DEFAULT_WEB_USER_ID
     reason: str = ""
-    target_revision: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -58,6 +33,7 @@ class ChatRequest(BaseModel):
     user_id: str = DEFAULT_WEB_USER_ID
     requested_skill_name: str | None = None
     task_id: str | None = None
+    parse_slash: bool = True
 
 
 class ToolApprovalRequest(BaseModel):
@@ -78,8 +54,25 @@ class CreateTaskRequest(BaseModel):
     requested_skill_name: str | None = None
 
 
+class ParseScheduleRequest(BaseModel):
+    schedule_text: str
+
+
 class CloseSessionRequest(BaseModel):
     summary: str = ""
+
+
+class UpdatePrincipleRequest(BaseModel):
+    content: str
+    change_note: str = ""
+    operator: str = DEFAULT_WEB_USER_ID
+
+
+class CreateLongTermRequest(BaseModel):
+    key: str
+    content: str
+    title: str = ""
+    operator: str = DEFAULT_WEB_USER_ID
 
 
 # ── 健康检查 ────────────────────────────────────────────
@@ -89,7 +82,7 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# ── Skill Catalog / Review API — SPEC 9.1 ─────────────────
+# ── Skill Catalog / Management API — SPEC 9.1 ─────────────────
 
 @router.post("/skills/reload")
 async def reload_skill_catalog(request: Request) -> dict[str, Any]:
@@ -100,97 +93,19 @@ async def reload_skill_catalog(request: Request) -> dict[str, Any]:
 async def list_skills(
     request: Request,
     status: str | None = None,
-    source: str | None = None,
     keyword: str | None = None,
 ) -> list[dict[str, Any]]:
-    return _skill_service(request).list_catalog(status=status, source=source, keyword=keyword)
+    return _skill_service(request).list_catalog(status=status, keyword=keyword)
 
 
 @router.get("/skills/audit")
 async def list_skill_audit(
     request: Request,
     skill_name: str | None = None,
-    draft_id: str | None = None,
     action: str | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    return _skill_service(request).list_audit(skill_name=skill_name, draft_id=draft_id, action=action, limit=limit)
-
-
-@router.get("/skills/migrations")
-async def list_skill_migrations(request: Request) -> list[dict[str, Any]]:
-    return _skill_service(request).list_migration_candidates()
-
-
-@router.post("/skills/drafts")
-async def create_skill_draft(req: CreateSkillDraftRequest, request: Request) -> dict[str, Any]:
-    try:
-        return _skill_service(request).create_draft(
-            requested_action=req.requested_action,
-            target_skill_name=req.target_skill_name,
-            proposed_name=req.proposed_name,
-            draft_skill_md=req.draft_skill_md,
-            draft_resources_manifest=req.draft_resources_manifest,
-            source_run_id=req.source_run_id,
-            source_session_id=req.source_session_id,
-            operator=req.operator,
-            user_intent_summary=req.user_intent_summary,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.get("/skills/drafts")
-async def list_skill_drafts(
-    request: Request,
-    review_status: str | None = None,
-    skill_name: str | None = None,
-) -> list[dict[str, Any]]:
-    return _skill_service(request).list_drafts(review_status=review_status, skill_name=skill_name)
-
-
-@router.get("/skills/drafts/{draft_id}")
-async def get_skill_draft(draft_id: str, request: Request) -> dict[str, Any]:
-    draft = _skill_service(request).get_draft(draft_id)
-    if draft is None:
-        raise HTTPException(status_code=404, detail="Skill draft not found")
-    return draft
-
-
-@router.patch("/skills/drafts/{draft_id}")
-async def update_skill_draft(draft_id: str, req: UpdateSkillDraftRequest, request: Request) -> dict[str, Any]:
-    try:
-        draft = _skill_service(request).update_draft(
-            draft_id,
-            proposed_name=req.proposed_name,
-            draft_skill_md=req.draft_skill_md,
-            draft_resources_manifest=req.draft_resources_manifest,
-            user_intent_summary=req.user_intent_summary,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if draft is None:
-        raise HTTPException(status_code=404, detail="Skill draft not found")
-    return draft
-
-
-@router.post("/skills/drafts/{draft_id}/approve")
-async def approve_skill_draft(draft_id: str, req: ReviewSkillDraftRequest, request: Request) -> dict[str, Any]:
-    try:
-        approved = _skill_service(request).approve_draft(draft_id, reviewer=req.reviewer, change_note=req.note)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if approved is None:
-        raise HTTPException(status_code=404, detail="Skill draft not found")
-    return approved
-
-
-@router.post("/skills/drafts/{draft_id}/reject")
-async def reject_skill_draft(draft_id: str, req: ReviewSkillDraftRequest, request: Request) -> dict[str, Any]:
-    rejected = _skill_service(request).reject_draft(draft_id, reviewer=req.reviewer, review_note=req.note)
-    if rejected is None:
-        raise HTTPException(status_code=404, detail="Skill draft not found")
-    return rejected
+    return _skill_service(request).list_audit(skill_name=skill_name, action=action, limit=limit)
 
 
 @router.post("/skills/{skill_name}/actions")
@@ -201,18 +116,12 @@ async def skill_action(skill_name: str, req: SkillActionRequest, request: Reques
             action=req.action,
             operator=req.operator,
             reason=req.reason,
-            target_revision=req.target_revision,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result is None:
-        raise HTTPException(status_code=404, detail="Skill or revision not found")
+        raise HTTPException(status_code=404, detail="Skill not found")
     return result
-
-
-@router.get("/skills/{skill_name}/revisions")
-async def list_skill_revisions(skill_name: str, request: Request) -> list[dict[str, Any]]:
-    return _skill_service(request).list_revisions(skill_name)
 
 
 @router.get("/skills/{skill_name}")
@@ -254,6 +163,7 @@ async def agent_chat(req: ChatRequest, request: Request):
                         requested_skill_name=req.requested_skill_name,
                         task_id=req.task_id,
                         event_callback=push_event,
+                        parse_slash=req.parse_slash,
                     )
                 except ValueError as exc:
                     await queue.put({"event": "reply", "payload": {"content": f"请求失败：{str(exc)}"}})
@@ -310,6 +220,7 @@ async def agent_chat(req: ChatRequest, request: Request):
             user_id=req.user_id,
             requested_skill_name=req.requested_skill_name,
             task_id=req.task_id,
+            parse_slash=req.parse_slash,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -346,6 +257,24 @@ async def tool_approval(approval_id: str, req: ToolApprovalRequest, request: Req
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/tools/file-operations")
+async def list_file_operations(
+    request: Request,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    return _agent_service(request).list_file_operations(
+        session_id=session_id, run_id=run_id, status=status, limit=limit,
+    )
+
+
+@router.get("/tools/file-locks")
+async def list_file_locks(request: Request, sandbox_path: str | None = None) -> list[dict[str, Any]]:
+    return _agent_service(request).list_file_locks(sandbox_path=sandbox_path)
 
 
 # ── 会话管理 API — SPEC 9.7 ────────────────────────────
@@ -417,6 +346,14 @@ async def list_tasks(request: Request, status: str | None = None) -> list[dict[s
     return _task_service(request).list_tasks(status=status)
 
 
+@router.post("/tasks/parse")
+async def parse_schedule(req: ParseScheduleRequest, request: Request) -> dict[str, Any]:
+    try:
+        return _task_service(request).parse_schedule(req.schedule_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/tasks")
 async def create_task(req: CreateTaskRequest, request: Request) -> dict[str, Any]:
     try:
@@ -476,8 +413,56 @@ async def cost_summary(request: Request, task_id: str | None = None) -> dict[str
 
 
 @router.get("/memory/search")
-async def memory_search(request: Request, query: str, session_id: str | None = None) -> dict[str, Any]:
-    return await _agent_service(request).memory_search(query, session_id=session_id)
+async def memory_search(
+    request: Request,
+    query: str,
+    session_id: str | None = None,
+    tiers: str | None = None,
+) -> dict[str, Any]:
+    parsed_tiers = [t.strip() for t in tiers.split(",") if t.strip()] if tiers else None
+    if parsed_tiers and "short_term" in parsed_tiers and not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required when tiers includes short_term")
+    return await _agent_service(request).memory_search(query, session_id=session_id, tiers=parsed_tiers)
+
+
+# ── 记忆管理 API — SPEC 9.9 ────────────────────────────
+
+@router.get("/memory/principle")
+async def get_principle(request: Request) -> dict[str, Any]:
+    ms = _memory_service(request)
+    content = ms.load_principle()
+    return {"content": content, "path": str(ms._principle_file)}
+
+
+@router.put("/memory/principle")
+async def update_principle(req: UpdatePrincipleRequest, request: Request) -> dict[str, Any]:
+    ms = _memory_service(request)
+    path = ms.save_principle(
+        req.content,
+        operator=req.operator,
+        change_note=req.change_note,
+    )
+    return {"content": req.content, "path": str(path), "status": "updated"}
+
+
+@router.get("/memory/long-term")
+async def list_long_term(request: Request) -> list[dict[str, Any]]:
+    return _memory_service(request).list_long_term()
+
+
+@router.post("/memory/long-term")
+async def create_long_term(req: CreateLongTermRequest, request: Request) -> dict[str, Any]:
+    try:
+        ms = _memory_service(request)
+        path = ms.save_long_term(
+            req.key,
+            req.content,
+            title=req.title,
+            operator=req.operator,
+        )
+        return {"key": req.key, "path": str(path), "status": "created"}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _agent_service(request: Request) -> AgentService:
@@ -490,6 +475,10 @@ def _skill_service(request: Request) -> SkillService:
 
 def _task_service(request: Request):
     return request.app.state.task_service
+
+
+def _memory_service(request: Request):
+    return request.app.state.memory_service
 
 
 def _format_sse(event: str, payload: dict[str, Any]) -> str:
