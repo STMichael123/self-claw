@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator
 
 from pydantic import BaseModel, Field
+import structlog
 
 
 # ── 消息与响应模型 ──────────────────────────────────────
@@ -77,9 +78,15 @@ class OpenAIAdapter(LLMAdapter):
     def __init__(self, model: str = "gpt-4o", api_key: str | None = None, base_url: str | None = None):
         from openai import AsyncOpenAI
 
+        resolved_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        if not resolved_key:
+            structlog.get_logger().warning(
+                "api_key_missing", adapter="openai", model=model,
+                hint="Set OPENAI_API_KEY env var or pass api_key parameter",
+            )
         self.model = model
         self._client = AsyncOpenAI(
-            api_key=api_key or os.environ.get("OPENAI_API_KEY", ""),
+            api_key=resolved_key,
             base_url=base_url or os.environ.get("OPENAI_BASE_URL") or None,
         )
 
@@ -159,8 +166,14 @@ class AnthropicAdapter(LLMAdapter):
     def __init__(self, model: str = "claude-sonnet-4-20250514", api_key: str | None = None):
         from anthropic import AsyncAnthropic
 
+        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not resolved_key:
+            structlog.get_logger().warning(
+                "api_key_missing", adapter="anthropic", model=model,
+                hint="Set ANTHROPIC_API_KEY env var or pass api_key parameter",
+            )
         self.model = model
-        self._client = AsyncAnthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", ""))
+        self._client = AsyncAnthropic(api_key=resolved_key)
 
     async def chat(
         self,

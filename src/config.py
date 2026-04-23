@@ -13,6 +13,9 @@ from pathlib import Path
 
 APP_VERSION = "1.2.0"
 
+_DEFAULT_EXEC_WHITELIST = "ls,dir,echo,cat,head,tail,wc,date,whoami,pwd"
+_DEFAULT_SUB_AGENT_KEYWORDS = "分析,调研,比较,拆解,汇总"
+
 
 @dataclass(frozen=True, slots=True)
 class AppSettings:
@@ -31,6 +34,11 @@ class AppSettings:
     file_lock_timeout_sec: int = 30
     file_read_max_bytes: int = 100_000
     file_write_max_bytes: int = 100_000
+    model_name: str = "gpt-4o"
+    default_max_steps: int = 10
+    default_web_user_id: str = "web-user"
+    exec_whitelist: str = _DEFAULT_EXEC_WHITELIST
+    sub_agent_trigger_keywords: str = _DEFAULT_SUB_AGENT_KEYWORDS
 
     @property
     def sandbox_root_path(self) -> Path:
@@ -116,6 +124,11 @@ _ENV_MAPPING = {
     "FILE_LOCK_TIMEOUT_SEC": ("file_lock_timeout_sec", int),
     "FILE_READ_MAX_BYTES": ("file_read_max_bytes", int),
     "FILE_WRITE_MAX_BYTES": ("file_write_max_bytes", int),
+    "LLM_MODEL": ("model_name", str),
+    "DEFAULT_MAX_STEPS": ("default_max_steps", int),
+    "DEFAULT_WEB_USER_ID": ("default_web_user_id", str),
+    "EXEC_WHITELIST": ("exec_whitelist", str),
+    "SUB_AGENT_TRIGGER_KEYWORDS": ("sub_agent_trigger_keywords", str),
 }
 
 

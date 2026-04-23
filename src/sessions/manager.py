@@ -270,10 +270,11 @@ class SessionManager:
             preview.append(f"{role}:{item['content'][:30]}")
         return " | ".join(preview)
 
-    def get_context_for_llm(self, session_id: str, *, recent_n: int = 10) -> tuple[list[dict[str, Any]], str]:
+    def get_context_for_llm(self, session_id: str, *, recent_n: int = 10, model_name: str | None = None) -> tuple[list[dict[str, Any]], str]:
         """获取滑动窗口上下文：最近 N 条原始消息 + 历史摘要。
 
         Spec FR-013: 保留最近 N 条原始消息 + 历史消息的 LLM 摘要。
+        当传入 model_name 时，根据 token 预算动态计算 recent_n。
 
         Returns:
             (recent_messages, summary_of_older)
@@ -282,12 +283,15 @@ class SessionManager:
             "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,),
         ).fetchall()
-        if len(all_rows) <= recent_n:
+
+        effective_n = self._compute_recent_n(all_rows, requested_n=recent_n, model_name=model_name)
+
+        if len(all_rows) <= effective_n:
             messages = [dict(r) for r in all_rows]
             return messages, ""
 
-        older_rows = all_rows[:-recent_n]
-        recent_rows = all_rows[-recent_n:]
+        older_rows = all_rows[:-effective_n]
+        recent_rows = all_rows[-effective_n:]
 
         session = self.get_session(session_id)
         summary = (session.get("context_snapshot") or "") if session else ""
@@ -306,6 +310,34 @@ class SessionManager:
             older_summary = "\n".join(f"{r['role']}: {r['content'][:150]}" for r in older_rows[-20:])[:500]
 
         return [dict(r) for r in recent_rows], older_summary
+
+    def _compute_recent_n(self, rows: list[sqlite3.Row], *, requested_n: int, model_name: str | None) -> int:
+        """根据 token 预算计算保留的最近消息条数。
+
+        从最新消息往前累计 token，直到达到窗口 40% 的预算则停止。
+        回退到 requested_n（默认 10）。
+        """
+        if not model_name or not rows:
+            return requested_n
+
+        try:
+            from src.models.router import count_tokens, max_context_tokens
+
+            window = max_context_tokens(model_name)
+            budget = int(window * 0.4)
+        except Exception:
+            return requested_n
+
+        total_tokens = 0
+        count = 0
+        for row in reversed(rows):
+            text = row["content"] or ""
+            total_tokens += count_tokens(text, model=model_name)
+            if total_tokens > budget:
+                break
+            count += 1
+
+        return max(count, min(requested_n, len(rows)))
 
     def _refresh_context_snapshot(self, session_id: str) -> None:
         """当累计 token 超过模型窗口 80% 时触发压缩（FR-010）。

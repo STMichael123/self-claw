@@ -21,12 +21,14 @@ from src.models.router import ModelRouter
 from src.services.cost import CostService
 from src.skills.registry import SkillRegistryError
 from src.sessions.manager import SessionManager
-from src.tools.builtins import build_builtin_tools
+from src.tools.builtins import build_builtin_tools, DEFAULT_EXEC_WHITELIST as _DEFAULT_EXEC_WHITELIST
 from src.tools.registry import ToolExecutor, ToolRegistry
 
 logger = structlog.get_logger()
 
-DEFAULT_WEB_USER_ID = "web-user"
+_DEFAULT_WEB_USER_ID = "web-user"
+_DEFAULT_SUB_AGENT_KEYWORDS = "分析,调研,比较,拆解,汇总"
+DEFAULT_WEB_USER_ID = _DEFAULT_WEB_USER_ID  # backward-compat re-export
 
 
 class AgentService:
@@ -44,6 +46,10 @@ class AgentService:
         max_parallel_sub_agents: int = 5,
         max_parallel_main_runs: int = 3,
         model_name: str = "gpt-4o",
+        default_web_user_id: str = _DEFAULT_WEB_USER_ID,
+        sub_agent_trigger_keywords: str = _DEFAULT_SUB_AGENT_KEYWORDS,
+        default_max_steps: int = 10,
+        exec_whitelist: str | None = None,
     ) -> None:
         self._db = db
         self.sessions = SessionManager(db, model_name=model_name)
@@ -55,22 +61,31 @@ class AgentService:
         self._hook_registry = hook_registry
         self.model_router = ModelRouter()
         self._model_name = model_name
+        self._default_web_user_id = default_web_user_id
+        self._sub_agent_trigger_keywords = [kw.strip() for kw in sub_agent_trigger_keywords.split(",") if kw.strip()]
+        self._default_max_steps = default_max_steps
+        self._exec_whitelist = (
+            {w.strip() for w in exec_whitelist.split(",") if w.strip()}
+            if exec_whitelist
+            else _DEFAULT_EXEC_WHITELIST
+        )
         self.sessions.set_llm(self.model_router.get_primary())
         self.tool_registry = ToolRegistry()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._sub_agent_semaphore = asyncio.Semaphore(max_parallel_sub_agents)
         self._max_parallel_main_runs = max_parallel_main_runs
-        for descriptor in build_builtin_tools(file_workspace_service, skill_service):
+        for descriptor in build_builtin_tools(file_workspace_service, skill_service, exec_whitelist=self._exec_whitelist):
             self.tool_registry.register(descriptor)
         self.tool_executor = ToolExecutor(self.tool_registry)
 
     def create_session(
         self,
         *,
-        user_id: str = DEFAULT_WEB_USER_ID,
+        user_id: str | None = None,
         title: str | None = None,
         channel_type: str = "web",
     ) -> dict[str, Any]:
+        user_id = user_id or self._default_web_user_id
         session_id = self.sessions.create_session(user_id, title=title, channel_type=channel_type)
         session = self.sessions.get_session(session_id)
         return {
@@ -156,13 +171,14 @@ class AgentService:
         session_id: str | None = None,
         session_title: str | None = None,
         stream: bool = False,
-        user_id: str = DEFAULT_WEB_USER_ID,
+        user_id: str | None = None,
         requested_skill_name: str | None = None,
         task_id: str | None = None,
         task_run_log_id: str | None = None,
         event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         parse_slash: bool = True,
     ) -> dict[str, Any]:
+        user_id = user_id or self._default_web_user_id
         # 解析斜杠命令（FR-015）
         if parse_slash and message.startswith("/"):
             slash_skill, slash_args = self._parse_slash_command(message)
@@ -229,6 +245,7 @@ class AgentService:
         self._remember_session_message(target_session_id, "user", message)
         self.sessions.set_current_run(target_session_id, run_id)
 
+        # ── 构建 Agent 运行上下文 ──
         memory_context = await self._build_memory_context(
             session_id=target_session_id,
             user_message=message,
@@ -248,13 +265,14 @@ class AgentService:
             if reply_hint:
                 memory_context = f"{memory_context}\n子 Agent 结果:\n{reply_hint}".strip()
 
+        # ── 执行主 Agent ──
         llm = self.model_router.get_primary()
         tool_defs, tool_executor = self._build_tool_runtime(None)
         main_agent = MainAgent(
             llm,
             tools=tool_defs,
             tool_executor=tool_executor,
-            max_steps=int(skill_context.get("max_steps") or 10),
+            max_steps=int(skill_context.get("max_steps") or self._default_max_steps),
             hook_registry=self._hook_registry,
         )
         result = await main_agent.chat(
@@ -278,76 +296,27 @@ class AgentService:
             initial=skill_context.get("activated_skills") or [],
         )
         activated_skill_names = [item.get("skill_name") for item in activated_skills if item.get("skill_name")]
+        model_name = getattr(llm, "model", "")
+        cancel_kw = dict(
+            session_id=target_session_id, session_action=session_action,
+            steps=[step.model_dump() for step in result.steps],
+            input_tokens=result.input_tokens, output_tokens=result.output_tokens, model_name=model_name,
+        )
 
+        # ── 处理审批挂起 ──
         if result.pending_approval and result.resume_state:
-            approval = self._create_tool_approval(
-                session_id=target_session_id,
-                run_id=run_id,
-                tool_name=str(result.pending_approval.get("tool_name", "")),
-                arguments=result.pending_approval.get("arguments", {}),
-                resume_state=result.resume_state,
+            return await self._handle_pending_approval(
+                result, target_session_id, run_id, session_action,
+                resolved_skill_name, activated_skill_names, task_id,
+                event_callback, cancel_kw,
             )
-            pending_result = {
-                "reply": f"工具 {approval['tool_name']} 正在等待审批。",
-                "latest_error": ErrorCode.TOOL_APPROVAL_PENDING,
-                "pending_approval": approval,
-            }
-            self._update_run_progress(
-                run_id,
-                steps_count=len(result.steps),
-                result_ref=pending_result,
-                activated_skills=activated_skill_names,
-            )
-            self.sessions.add_message(
-                target_session_id,
-                "assistant",
-                pending_result["reply"],
-                run_id=run_id,
-                metadata={
-                    "run_status": RunStatus.RUNNING.value,
-                    "pending_approval": approval,
-                    "requested_skill_name": resolved_skill_name,
-                    "activated_skills": activated_skill_names,
-                },
-            )
-            self._remember_session_message(target_session_id, "assistant", pending_result["reply"])
-            await self._emit_event(
-                event_callback,
-                {
-                    "event": "approval_pending",
-                    **approval,
-                },
-            )
-            return {
-                "session_id": target_session_id,
-                "run_id": run_id,
-                "session_action": session_action,
-                "status": "waiting_approval",
-                "reply": pending_result["reply"],
-                "steps": [step.model_dump() for step in result.steps],
-                "usage": {
-                    "input_tokens": result.input_tokens,
-                    "output_tokens": result.output_tokens,
-                    "estimated_cost": 0.0,
-                    "model": getattr(llm, "model", ""),
-                },
-                "pending_approval": approval,
-            }
 
-        if result.status == RunStatus.CANCELLED or self._is_run_cancelled(run_id):
-            logger.info("run_cancelled_before_persist", run_id=run_id, session_id=target_session_id)
-            return self._build_cancelled_payload(
-                session_id=target_session_id,
-                run_id=run_id,
-                session_action=session_action,
-                steps=[step.model_dump() for step in result.steps],
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                model_name=getattr(llm, "model", ""),
-            )
+        # ── 持久化与最终确认 ──
+        if cancel_payload := self._check_run_cancelled(result.status, run_id, **cancel_kw):
+            return cancel_payload
 
         estimated_cost = self._estimate_cost(
-            model_name=getattr(llm, "model", ""),
+            model_name=model_name,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
         )
@@ -358,32 +327,11 @@ class AgentService:
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
             estimated_cost=estimated_cost,
-            model_name=getattr(llm, "model", ""),
+            model_name=model_name,
             task_id=task_id,
         )
-        if not persisted:
-            logger.info("run_cancelled_before_persist", run_id=run_id, session_id=target_session_id)
-            return self._build_cancelled_payload(
-                session_id=target_session_id,
-                run_id=run_id,
-                session_action=session_action,
-                steps=[step.model_dump() for step in result.steps],
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                model_name=getattr(llm, "model", ""),
-            )
-
-        if self._is_run_cancelled(run_id):
-            logger.info("run_cancelled_before_finalize", run_id=run_id, session_id=target_session_id)
-            return self._build_cancelled_payload(
-                session_id=target_session_id,
-                run_id=run_id,
-                session_action=session_action,
-                steps=[step.model_dump() for step in result.steps],
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                model_name=getattr(llm, "model", ""),
-            )
+        if not persisted or (cancel_payload := self._check_run_cancelled(None, run_id, **cancel_kw)):
+            return cancel_payload or self._build_cancelled_payload(run_id=run_id, **cancel_kw)
 
         result_ref = {
             "reply": result.reply,
@@ -416,31 +364,11 @@ class AgentService:
             },
             guard_run_not_cancelled=True,
         )
-        if not message_id:
-            logger.info("run_cancelled_during_finalize", run_id=run_id, session_id=target_session_id)
-            return self._build_cancelled_payload(
-                session_id=target_session_id,
-                run_id=run_id,
-                session_action=session_action,
-                steps=[step.model_dump() for step in result.steps],
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                model_name=getattr(llm, "model", ""),
-            )
+        if not message_id or (cancel_payload := self._check_run_cancelled(None, run_id, **cancel_kw)):
+            return cancel_payload or self._build_cancelled_payload(run_id=run_id, **cancel_kw)
+
         self._remember_session_message(target_session_id, "assistant", result.reply)
         self.sessions.set_current_run(target_session_id, run_id)
-
-        if self._is_run_cancelled(run_id):
-            logger.info("run_cancelled_after_finalize", run_id=run_id, session_id=target_session_id)
-            return self._build_cancelled_payload(
-                session_id=target_session_id,
-                run_id=run_id,
-                session_action=session_action,
-                steps=[step.model_dump() for step in result.steps],
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                model_name=getattr(llm, "model", ""),
-            )
 
         return {
             "session_id": target_session_id,
@@ -453,7 +381,7 @@ class AgentService:
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
                 "estimated_cost": estimated_cost,
-                "model": getattr(llm, "model", ""),
+                "model": model_name,
             },
             "activated_skills": activated_skill_names,
         }
@@ -502,8 +430,9 @@ class AgentService:
         approval_id: str,
         *,
         decision: str,
-        operator: str = DEFAULT_WEB_USER_ID,
+        operator: str | None = None,
     ) -> dict[str, Any]:
+        operator = operator or self._default_web_user_id
         if decision not in {"approved", "rejected"}:
             raise ValueError("invalid approval decision")
 
@@ -596,7 +525,8 @@ class AgentService:
         )
         return {"files": files, "vectors": vectors}
 
-    def status_entry(self, *, user_id: str = DEFAULT_WEB_USER_ID, status: str | None = None) -> list[dict[str, Any]]:
+    def status_entry(self, *, user_id: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        user_id = user_id or self._default_web_user_id
         sessions = self.sessions.list_sessions(status=status or SessionStatus.ACTIVE, user_id=user_id)
         return [
             {
@@ -614,10 +544,11 @@ class AgentService:
     def status_overview(
         self,
         *,
-        user_id: str = DEFAULT_WEB_USER_ID,
+        user_id: str | None = None,
         session_status: str | None = None,
         run_status: str | None = None,
     ) -> dict[str, Any]:
+        user_id = user_id or self._default_web_user_id
         sessions = self.sessions.list_sessions(status=session_status or SessionStatus.ACTIVE, user_id=user_id)
         result = []
         for session in sessions:
@@ -749,6 +680,96 @@ class AgentService:
         if event_callback is None:
             return
         await event_callback(payload)
+
+    def _check_run_cancelled(
+        self,
+        result_status: Any | None,
+        run_id: str,
+        *,
+        session_id: str,
+        session_action: str,
+        steps: list[dict[str, Any]],
+        input_tokens: int,
+        output_tokens: int,
+        model_name: str,
+    ) -> dict[str, Any] | None:
+        """若运行已取消则返回 cancelled payload，否则返回 None。"""
+        cancelled = (
+            (result_status is not None and result_status == RunStatus.CANCELLED)
+            or self._is_run_cancelled(run_id)
+        )
+        if not cancelled:
+            return None
+        return self._build_cancelled_payload(
+            session_id=session_id,
+            run_id=run_id,
+            session_action=session_action,
+            steps=steps,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            model_name=model_name,
+        )
+
+    async def _handle_pending_approval(
+        self,
+        result: Any,
+        target_session_id: str,
+        run_id: str,
+        session_action: str,
+        resolved_skill_name: str | None,
+        activated_skill_names: list[str],
+        task_id: str | None,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        cancel_kw: dict[str, Any],
+    ) -> dict[str, Any]:
+        """处理工具审批挂起逻辑，返回审批 payload。"""
+        approval = self._create_tool_approval(
+            session_id=target_session_id,
+            run_id=run_id,
+            tool_name=str(result.pending_approval.get("tool_name", "")),
+            arguments=result.pending_approval.get("arguments", {}),
+            resume_state=result.resume_state,
+        )
+        pending_result = {
+            "reply": f"工具 {approval['tool_name']} 正在等待审批。",
+            "latest_error": ErrorCode.TOOL_APPROVAL_PENDING,
+            "pending_approval": approval,
+        }
+        self._update_run_progress(
+            run_id,
+            steps_count=len(result.steps),
+            result_ref=pending_result,
+            activated_skills=activated_skill_names,
+        )
+        self.sessions.add_message(
+            target_session_id,
+            "assistant",
+            pending_result["reply"],
+            run_id=run_id,
+            metadata={
+                "run_status": RunStatus.RUNNING.value,
+                "pending_approval": approval,
+                "requested_skill_name": resolved_skill_name,
+                "activated_skills": activated_skill_names,
+            },
+        )
+        self._remember_session_message(target_session_id, "assistant", pending_result["reply"])
+        await self._emit_event(event_callback, {"event": "approval_pending", **approval})
+        return {
+            "session_id": target_session_id,
+            "run_id": run_id,
+            "session_action": session_action,
+            "status": "waiting_approval",
+            "reply": pending_result["reply"],
+            "steps": [step.model_dump() for step in result.steps],
+            "usage": {
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "estimated_cost": 0.0,
+                "model": cancel_kw["model_name"],
+            },
+            "pending_approval": approval,
+        }
 
     async def _build_memory_context(
         self,
@@ -1027,7 +1048,7 @@ class AgentService:
             llm,
             tools=tool_defs,
             tool_executor=tool_executor,
-            max_steps=int(skill_context.get("max_steps") or 10),
+            max_steps=int(skill_context.get("max_steps") or self._default_max_steps),
             hook_registry=self._hook_registry,
         )
         result = await main_agent.chat(
@@ -1179,7 +1200,7 @@ class AgentService:
             return
         session = self.sessions.get_session(session_id) if session_id and session_id != "-" else None
         channel_type = (session or {}).get("channel_type") or "test"
-        target_uid = (session or {}).get("user_id") or DEFAULT_WEB_USER_ID
+        target_uid = (session or {}).get("user_id") or self._default_web_user_id
         try:
             await self.notification_service.notify(
                 channel_type=channel_type,
@@ -1362,7 +1383,9 @@ class AgentService:
 
     def _build_history(self, session_id: str) -> list[ChatMessage]:
         """构建消息历史，使用滑动窗口 + 前文摘要（Spec FR-013）。"""
-        recent_messages, older_summary = self.sessions.get_context_for_llm(session_id, recent_n=10)
+        recent_messages, older_summary = self.sessions.get_context_for_llm(
+            session_id, recent_n=10, model_name=self._model_name,
+        )
         history: list[ChatMessage] = []
         if older_summary:
             history.append(ChatMessage(role="system", content=f"[历史对话摘要]\n{older_summary}"))
@@ -1382,7 +1405,7 @@ class AgentService:
             raise ValueError(f"当前已有 {self._max_parallel_main_runs} 个主 Agent 并行运行中，请等待完成或取消后再试")
 
     def _should_spawn_sub_agent(self, message: str) -> bool:
-        return any(keyword in message for keyword in ["分析", "调研", "比较", "拆解", "汇总"])
+        return any(keyword in message for keyword in self._sub_agent_trigger_keywords)
 
     async def _run_sub_agent(
         self,

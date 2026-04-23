@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -79,7 +78,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         hook_registry=app.state.hook_registry,
         max_parallel_sub_agents=settings.max_parallel_sub_agents,
         max_parallel_main_runs=settings.max_parallel_main_runs,
-        model_name=os.environ.get("LLM_MODEL", "gpt-4o"),
+        model_name=settings.model_name,
+        default_web_user_id=settings.default_web_user_id,
+        sub_agent_trigger_keywords=settings.sub_agent_trigger_keywords,
+        default_max_steps=settings.default_max_steps,
+        exec_whitelist=settings.exec_whitelist,
     )
     app.state.task_service = TaskService(
         db,

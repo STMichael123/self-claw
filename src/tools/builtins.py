@@ -20,7 +20,7 @@ from src.skills.registry import SkillRegistryError
 from src.tools.registry import ToolDescriptor, ToolError
 
 # ── exec 命令白名单 ─────────────────────────────────────
-EXEC_WHITELIST = {"ls", "dir", "echo", "cat", "head", "tail", "wc", "date", "whoami", "pwd"}
+DEFAULT_EXEC_WHITELIST = {"ls", "dir", "echo", "cat", "head", "tail", "wc", "date", "whoami", "pwd"}
 DEFAULT_TEXT_LIMIT = 5000
 DEFAULT_HEAD_LINES = 10
 
@@ -34,12 +34,16 @@ async def web_fetch(url: str, *, timeout: int = 15) -> str:
 
 
 async def web_search(query: str) -> str:
-    """简单网页搜索（占位实现，需接入实际搜索 API）。"""
-    return f"[web_search] 搜索 '{query}' 的结果需要接入实际搜索 API。"
+    """简单网页搜索（[实验性] 需接入实际搜索 API 后方可使用）。"""
+    return (
+        f"[实验性] web_search 尚未接入实际搜索 API，无法返回 '{query}' 的搜索结果。"
+        "请联系管理员配置搜索服务后重试。"
+    )
 
 
-async def exec_command(command: str) -> str:
+async def exec_command(command: str, *, whitelist: set[str] | None = None) -> str:
     """执行白名单内的安全内置命令。"""
+    allowed = whitelist or DEFAULT_EXEC_WHITELIST
     try:
         parts = _split_command(command)
     except ValueError as exc:
@@ -49,8 +53,8 @@ async def exec_command(command: str) -> str:
         return "Error: command is empty"
 
     cmd_name = parts[0].lower()
-    if cmd_name not in EXEC_WHITELIST:
-        return f"Error: command '{cmd_name}' is not in the allowed whitelist: {EXEC_WHITELIST}"
+    if cmd_name not in allowed:
+        return f"Error: command '{cmd_name}' is not in the allowed whitelist: {sorted(allowed)}"
 
     handler = _EXEC_HANDLERS[cmd_name]
     try:
@@ -192,7 +196,10 @@ _EXEC_HANDLERS = {
 def build_builtin_tools(
     file_workspace: FileWorkspaceService | None = None,
     skill_service: SkillService | None = None,
+    exec_whitelist: set[str] | None = None,
 ) -> list[ToolDescriptor]:
+    effective_whitelist = exec_whitelist or DEFAULT_EXEC_WHITELIST
+
     async def list_dir(path: str = ".", runtime_context: dict[str, Any] | None = None) -> str:
         workspace = _require_workspace(file_workspace)
         return _to_json(workspace.list_dir(path, runtime_context=runtime_context))
@@ -259,7 +266,7 @@ def build_builtin_tools(
                 runtime_context["skill_tool_allowlist"] = sorted(merged_tools)
         return _to_json(payload)
 
-    return [
+    tools = [
         ToolDescriptor(
             name="web_fetch",
             display_name="网页抓取",
@@ -381,23 +388,30 @@ def build_builtin_tools(
             category="builtin",
             handler=activate_skill,
         ),
-        ToolDescriptor(
-            name="exec",
-            display_name="命令执行",
-            description=f"执行系统命令（仅限白名单: {', '.join(sorted(EXEC_WHITELIST))}）",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "要执行的命令"},
-                },
-                "required": ["command"],
-            },
-            returns={"type": "string"},
-            requires_approval=True,
-            category="builtin",
-            handler=exec_command,
-        ),
     ]
+
+    # exec handler must be defined outside the list literal
+    async def _exec_with_whitelist(command: str) -> str:
+        return await exec_command(command, whitelist=effective_whitelist)
+
+    tools.append(ToolDescriptor(
+        name="exec",
+        display_name="命令执行",
+        description=f"执行系统命令（仅限白名单: {', '.join(sorted(effective_whitelist))}）",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的命令"},
+            },
+            "required": ["command"],
+        },
+        returns={"type": "string"},
+        requires_approval=True,
+        category="builtin",
+        handler=_exec_with_whitelist,
+    ))
+
+    return tools
 
 BUILTIN_TOOLS = build_builtin_tools()
 
