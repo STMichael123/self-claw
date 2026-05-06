@@ -44,6 +44,15 @@ class TestMemoryService:
         entries = memory_service.list_long_term()
         assert any(e["key"] == "sales-playbook" for e in entries)
 
+    @pytest.mark.parametrize("invalid_key", ["../escape", "Sales-Playbook", "sales_playbook", "", "a/b"])
+    def test_save_long_term_rejects_invalid_key(self, memory_service: MemoryService, invalid_key: str) -> None:
+        with pytest.raises(ValueError, match="lowercase kebab-case"):
+            memory_service.save_long_term(invalid_key, "bad")
+
+    def test_load_long_term_rejects_invalid_key(self, memory_service: MemoryService) -> None:
+        with pytest.raises(ValueError, match="lowercase kebab-case"):
+            memory_service.load_long_term("../escape")
+
     def test_search_short_term_can_be_limited_by_session(self, memory_service: MemoryService) -> None:
         memory_service.save_short_term("session-a", "alpha only for a")
         memory_service.save_short_term("session-b", "alpha only for b")

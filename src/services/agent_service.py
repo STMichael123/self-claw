@@ -31,6 +31,16 @@ _DEFAULT_SUB_AGENT_KEYWORDS = "分析,调研,比较,拆解,汇总"
 DEFAULT_WEB_USER_ID = _DEFAULT_WEB_USER_ID  # backward-compat re-export
 
 
+class AgentRateLimitError(Exception):
+    """主 Agent 并发超限。"""
+
+    def __init__(self, message: str, *, retry_after_sec: float = 1.0) -> None:
+        self.code = ErrorCode.RATE_LIMITED
+        self.message = message
+        self.retry_after_sec = retry_after_sec
+        super().__init__(message)
+
+
 class AgentService:
     """封装会话、运行记录与 Agent 调用。"""
 
@@ -86,6 +96,7 @@ class AgentService:
         channel_type: str = "web",
     ) -> dict[str, Any]:
         user_id = user_id or self._default_web_user_id
+        self._expire_and_archive_stale_sessions(user_id=user_id)
         session_id = self.sessions.create_session(user_id, title=title, channel_type=channel_type)
         session = self.sessions.get_session(session_id)
         return {
@@ -96,10 +107,12 @@ class AgentService:
         }
 
     def list_sessions(self, *, status: str | None = None, user_id: str | None = None) -> list[dict[str, Any]]:
+        self._expire_and_archive_stale_sessions(user_id=user_id)
         sessions = self.sessions.list_sessions(status=status, user_id=user_id)
         return [self._serialize_session_summary(item) for item in sessions]
 
     def get_session_detail(self, session_id: str) -> dict[str, Any] | None:
+        self._expire_and_archive_stale_sessions()
         session = self.sessions.get_session(session_id)
         if session is None:
             return None
@@ -124,15 +137,17 @@ class AgentService:
 
         # on_session_archive hook (FR-016)
         if self._hook_registry is not None:
-            import asyncio as _asyncio
             try:
-                _asyncio.create_task(
+                loop = asyncio.get_running_loop()
+                loop.create_task(
                     self._hook_registry.run_hooks("on_session_archive", {
                         "session_id": session_id,
                         "summary": summary,
                         "message_count": message_count,
                     })
                 )
+            except RuntimeError:
+                logger.debug("on_session_archive_hook_skipped_no_loop", session_id=session_id)
             except Exception as exc:
                 logger.warning("on_session_archive_hook_failed", session_id=session_id, error=str(exc))
 
@@ -145,16 +160,21 @@ class AgentService:
                     source_type="session_archive",
                     source_ref=session_id,
                 )
-                background = asyncio.create_task(
-                    self.memory_service.save_vector(
-                        summary,
-                        source_type="session_summary",
-                        source_id=session_id,
-                        metadata={"session_id": session_id},
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    logger.debug("archive_session_vector_skipped_no_loop", session_id=session_id)
+                else:
+                    background = loop.create_task(
+                        self.memory_service.save_vector(
+                            summary,
+                            source_type="session_summary",
+                            source_id=session_id,
+                            metadata={"session_id": session_id},
+                        )
                     )
-                )
-                self._background_tasks.add(background)
-                background.add_done_callback(self._background_tasks.discard)
+                    self._background_tasks.add(background)
+                    background.add_done_callback(self._background_tasks.discard)
             except Exception as exc:
                 logger.warning("archive_session_memory_failed", session_id=session_id, error=str(exc))
         return {
@@ -162,6 +182,14 @@ class AgentService:
             "status": "archived",
             "summary": summary,
         }
+
+    def _expire_and_archive_stale_sessions(self, *, user_id: str | None = None) -> None:
+        expired_ids = self.sessions.expire_stale_sessions(user_id=user_id)
+        for session_id in expired_ids:
+            try:
+                self.close_session(session_id)
+            except Exception as exc:
+                logger.warning("stale_session_archive_failed", session_id=session_id, error=str(exc))
 
     async def chat(
         self,
@@ -179,6 +207,7 @@ class AgentService:
         parse_slash: bool = True,
     ) -> dict[str, Any]:
         user_id = user_id or self._default_web_user_id
+        self._expire_and_archive_stale_sessions(user_id=user_id)
         # 解析斜杠命令（FR-015）
         if parse_slash and message.startswith("/"):
             slash_skill, slash_args = self._parse_slash_command(message)
@@ -209,7 +238,7 @@ class AgentService:
         skill_context = self._resolve_requested_skill_context(resolved_skill_name)
         available_skills_catalog = self._list_available_skills_catalog()
         self._validate_skill_input(skill_context, message)
-        self._ensure_main_run_capacity()
+        self._ensure_main_run_capacity(user_id=user_id)
 
         try:
             run_id = self._create_run(
@@ -252,18 +281,12 @@ class AgentService:
             base_snapshot=session.get("context_snapshot") or "",
         )
         principle_text = self.memory_service.load_principle() if self.memory_service else ""
-        child_runs: list[dict[str, Any]] = []
-        if self._should_spawn_sub_agent(message):
-            child_run = await self._run_sub_agent(
-                parent_run_id=run_id,
-                session_id=target_session_id,
-                goal=message,
-                session_title=session.get("title") or "",
-            )
-            child_runs.append(child_run)
-            reply_hint = _dig(child_run, "result_ref", "reply") or _dig(child_run, "result_ref", "output", "reply") or ""
-            if reply_hint:
-                memory_context = f"{memory_context}\n子 Agent 结果:\n{reply_hint}".strip()
+        runtime_context = dict(skill_context.get("runtime_context") or {})
+        runtime_context.update({
+            "session_id": target_session_id,
+            "session_title": session.get("title") or "",
+            "user_id": user_id,
+        })
 
         # ── 执行主 Agent ──
         llm = self.model_router.get_primary()
@@ -281,13 +304,19 @@ class AgentService:
             available_skills_catalog=available_skills_catalog,
             activated_skills=skill_context.get("activated_skills") or None,
             principle=principle_text,
-            long_term_context=memory_context,
-            short_term_context="",
+            long_term_context=memory_context["long_term_context"],
+            short_term_context=memory_context["short_term_context"],
+            memory_context=memory_context["short_term_context"],
             run_id=run_id,
             cancellation_checker=lambda: self._is_run_cancelled(run_id),
             cancellation_waiter=lambda: self._wait_for_run_cancelled(run_id),
             event_callback=event_callback,
-            runtime_context=skill_context.get("runtime_context") or None,
+            sub_agent_runner=lambda **kwargs: self._run_sub_agent(
+                session_id=target_session_id,
+                **kwargs,
+            ),
+            sub_agent_fallback_keywords=self._sub_agent_trigger_keywords,
+            runtime_context=runtime_context,
         )
 
         result = self._apply_skill_output_validation(result=result, skill_context=skill_context)
@@ -333,6 +362,7 @@ class AgentService:
         if not persisted or (cancel_payload := self._check_run_cancelled(None, run_id, **cancel_kw)):
             return cancel_payload or self._build_cancelled_payload(run_id=run_id, **cancel_kw)
 
+        child_runs = self._list_runs(parent_run_id=run_id)
         result_ref = {
             "reply": result.reply,
             "steps": [step.model_dump() for step in result.steps],
@@ -527,6 +557,7 @@ class AgentService:
 
     def status_entry(self, *, user_id: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         user_id = user_id or self._default_web_user_id
+        self._expire_and_archive_stale_sessions(user_id=user_id)
         sessions = self.sessions.list_sessions(status=status or SessionStatus.ACTIVE, user_id=user_id)
         return [
             {
@@ -549,6 +580,7 @@ class AgentService:
         run_status: str | None = None,
     ) -> dict[str, Any]:
         user_id = user_id or self._default_web_user_id
+        self._expire_and_archive_stale_sessions(user_id=user_id)
         sessions = self.sessions.list_sessions(status=session_status or SessionStatus.ACTIVE, user_id=user_id)
         result = []
         for session in sessions:
@@ -571,6 +603,7 @@ class AgentService:
         return {"sessions": result}
 
     def status_session(self, session_id: str) -> dict[str, Any] | None:
+        self._expire_and_archive_stale_sessions()
         session = self.sessions.get_session(session_id)
         if session is None:
             return None
@@ -777,8 +810,9 @@ class AgentService:
         session_id: str,
         user_message: str,
         base_snapshot: str,
-    ) -> str:
-        parts: list[str] = []
+    ) -> dict[str, str]:
+        long_term_parts: list[str] = []
+        short_term_parts: list[str] = []
         if self.memory_service is not None:
             long_term_entries = self.memory_service.list_long_term()
             if long_term_entries:
@@ -787,13 +821,16 @@ class AgentService:
                     line = f"- {entry.get('title') or entry['key']}: {entry.get('snippet', '')[:120].strip()}"
                     line += _staleness_tag(entry.get("mtime"))
                     lines.append(line)
-                parts.append("长期记忆（索引摘要）:\n" + "\n".join(lines))
+                long_term_parts.append("长期记忆（索引摘要）:\n" + "\n".join(lines))
 
         if base_snapshot.strip():
-            parts.append(f"会话摘要:\n{base_snapshot.strip()}")
+            short_term_parts.append(f"会话摘要:\n{base_snapshot.strip()}")
 
         if self.memory_service is None:
-            return "\n\n".join(parts)
+            return {
+                "long_term_context": "\n\n".join(part for part in long_term_parts if part.strip()),
+                "short_term_context": "\n\n".join(part for part in short_term_parts if part.strip()),
+            }
 
         file_hits = self.memory_service.search_files(user_message, scope="short_term", session_id=session_id, limit=3)
         vector_hits = await self.memory_service.search_vector(
@@ -809,24 +846,27 @@ class AgentService:
         )
 
         if file_hits:
-            parts.append(
+            short_term_parts.append(
                 "近期记忆:\n" + "\n".join(
                     f"- {item['snippet'][:180].strip()}" for item in file_hits if item.get("snippet")
                 )
             )
         if vector_hits:
-            parts.append(
+            short_term_parts.append(
                 "会话语义记忆:\n" + "\n".join(
                     f"- {item['text'][:180].strip()}" for item in vector_hits if item.get("text")
                 )
             )
         if shared_vector_hits:
-            parts.append(
+            long_term_parts.append(
                 "共享语义记忆:\n" + "\n".join(
                     f"- {item['text'][:180].strip()}" for item in shared_vector_hits if item.get("text")
                 )
             )
-        return "\n\n".join(part for part in parts if part.strip())
+        return {
+            "long_term_context": "\n\n".join(part for part in long_term_parts if part.strip()),
+            "short_term_context": "\n\n".join(part for part in short_term_parts if part.strip()),
+        }
 
     def _remember_session_message(self, session_id: str, role: str, content: str) -> None:
         if self.memory_service is None:
@@ -1395,17 +1435,24 @@ class AgentService:
             history.append(ChatMessage(role=item["role"], content=item["content"]))
         return history
 
-    def _ensure_main_run_capacity(self) -> None:
+    def _ensure_main_run_capacity(self, *, user_id: str) -> None:
         """检查当前用户活跃的顶层主 Agent 运行数量是否已达上限。"""
         running_count = self._db.execute(
-            "SELECT COUNT(*) AS total FROM agent_runs WHERE agent_role = 'main' AND parent_run_id IS NULL AND status = ?",
-            (RunStatus.RUNNING.value,),
+            """
+            SELECT COUNT(*) AS total
+            FROM agent_runs ar
+            JOIN sessions s ON s.id = ar.session_id
+            WHERE ar.agent_role = 'main'
+              AND ar.parent_run_id IS NULL
+              AND ar.status = ?
+              AND s.user_id = ?
+            """,
+            (RunStatus.RUNNING.value, user_id),
         ).fetchone()
         if running_count and int(running_count["total"]) >= self._max_parallel_main_runs:
-            raise ValueError(f"当前已有 {self._max_parallel_main_runs} 个主 Agent 并行运行中，请等待完成或取消后再试")
-
-    def _should_spawn_sub_agent(self, message: str) -> bool:
-        return any(keyword in message for keyword in self._sub_agent_trigger_keywords)
+            raise AgentRateLimitError(
+                f"当前用户已有 {self._max_parallel_main_runs} 个主 Agent 并行运行中，请等待完成后再试"
+            )
 
     async def _run_sub_agent(
         self,
@@ -1414,6 +1461,9 @@ class AgentService:
         session_id: str,
         goal: str,
         session_title: str,
+        sub_agent_role: str = "analyst",
+        allowed_skills: list[str] | None = None,
+        context_pack: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         async with self._sub_agent_semaphore:
             return await self._run_sub_agent_inner(
@@ -1421,6 +1471,9 @@ class AgentService:
                 session_id=session_id,
                 goal=goal,
                 session_title=session_title,
+                sub_agent_role=sub_agent_role,
+                allowed_skills=allowed_skills or [],
+                context_pack=context_pack or {},
             )
 
     async def _run_sub_agent_inner(
@@ -1430,6 +1483,9 @@ class AgentService:
         session_id: str,
         goal: str,
         session_title: str,
+        sub_agent_role: str,
+        allowed_skills: list[str],
+        context_pack: dict[str, Any],
     ) -> dict[str, Any]:
         child_run_id = self._create_run(
             session_id=session_id,
@@ -1437,7 +1493,7 @@ class AgentService:
             status=RunStatus.RUNNING.value,
             parent_run_id=parent_run_id,
             task_ref=goal[:120],
-            context_ref={"display_name": "子 Agent · 分析", "goal": goal},
+            context_ref={"display_name": f"子 Agent · {sub_agent_role}", "goal": goal},
         )
         llm = self.model_router.get_primary()
         executor = SubAgentExecutor(llm, tool_executor=self.tool_executor)
@@ -1445,9 +1501,10 @@ class AgentService:
             SubAgentRequest(
                 run_id=child_run_id,
                 parent_run_id=parent_run_id,
-                sub_agent_role="analyst",
+                sub_agent_role=sub_agent_role,
                 goal=goal,
-                context_pack={"session_title": session_title or "未命名会话"},
+                allowed_skills=allowed_skills,
+                context_pack=context_pack or {"session_title": session_title or "未命名会话"},
             ),
             cancellation_checker=lambda: self._is_run_cancelled(child_run_id),
             cancellation_waiter=lambda: self._wait_for_run_cancelled(child_run_id),

@@ -27,6 +27,7 @@ const el = {
     statusOverviewList: document.getElementById('status-overview-list'),
     statusRunTree: document.getElementById('status-run-tree'),
     skillsList: document.getElementById('skills-list'),
+    skillsAudit: document.getElementById('skills-audit'),
     skillsSummary: document.getElementById('skills-summary'),
     skillSearch: document.getElementById('skill-search'),
     tasksList: document.getElementById('tasks-list'),
@@ -64,7 +65,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
 document.getElementById('btn-back-entry').addEventListener('click', () => setView('entry'));
 document.getElementById('btn-refresh-chat').addEventListener('click', () => refreshCurrentSession());
 document.getElementById('btn-refresh-status').addEventListener('click', () => loadStatusOverview(true));
-document.getElementById('btn-refresh-skills').addEventListener('click', () => loadSkills());
+document.getElementById('btn-refresh-skills').addEventListener('click', () => loadSkillView());
 document.getElementById('btn-refresh-tasks').addEventListener('click', () => loadTasks());
 document.getElementById('btn-refresh-tools').addEventListener('click', () => loadTools());
 document.getElementById('btn-close-session').addEventListener('click', () => closeCurrentSession());
@@ -79,12 +80,12 @@ document.querySelectorAll('[data-close]').forEach(button => {
     });
 });
 
-el.skillFilter.addEventListener('change', () => loadSkills());
+el.skillFilter.addEventListener('change', () => loadSkillView());
 el.skillSearch.addEventListener('input', () => {
     if (state.skillSearchTimer) {
         window.clearTimeout(state.skillSearchTimer);
     }
-    state.skillSearchTimer = window.setTimeout(() => loadSkills(), 180);
+    state.skillSearchTimer = window.setTimeout(() => loadSkillView(), 180);
 });
 el.chatSend.addEventListener('click', () => sendMessage());
 el.chatInput.addEventListener('keydown', event => {
@@ -123,23 +124,6 @@ el.statusOverviewList.addEventListener('click', event => {
     const item = findClosestFromEvent(event, '[data-status-session-id]');
     if (item) {
         loadStatusSession(item.dataset.statusSessionId);
-    }
-});
-
-el.skillsList.addEventListener('click', async event => {
-    const button = findClosestFromEvent(event, '[data-skill-name]');
-    if (!button) {
-        return;
-    }
-    try {
-        await requestJSON(`/skills/${button.dataset.skillName}/actions`, {
-            method: 'POST',
-            body: { action: button.dataset.nextAction, operator: USER_ID },
-        });
-        await Promise.all([loadSkills(), loadTaskSkills()]);
-        showToast(button.dataset.nextAction === 'enable' ? 'Skill 已启用' : 'Skill 已停用', 'success');
-    } catch (error) {
-        showToast(error.message || 'Skill 状态更新失败', 'error');
     }
 });
 
@@ -245,7 +229,7 @@ function setView(view) {
         loadStatusOverview(true);
     }
     if (view === 'skills') {
-        loadSkills();
+        loadSkillView();
     }
     if (view === 'tasks') {
         loadTasks();
@@ -934,10 +918,7 @@ async function loadSkills() {
             params.set('keyword', keyword);
         }
         const suffix = params.size ? `?${params.toString()}` : '';
-        const [skills] = await Promise.all([
-            fetchJSON(`/skills${suffix}`),
-        ]);
-        renderSkillsSummary(skills);
+        const skills = await fetchJSON(`/skills${suffix}`);
 
         if (!skills.length) {
             el.skillsList.innerHTML = '<tr><td colspan="5" class="empty">暂无 Skill</td></tr>';
@@ -948,28 +929,62 @@ async function loadSkills() {
                     <td>${renderBadge(skill.status)}</td>
                     <td>${escapeHTML(skill.source || 'project')}</td>
                     <td>${escapeHTML(formatTime(skill.last_indexed_at || skill.indexed_at))}</td>
-                    <td>
-                        <button class="btn btn-secondary" data-skill-name="${escapeHTML(skill.skill_name || skill.name)}" data-next-action="${skill.status === 'enabled' ? 'disable' : 'enable'}">
-                            ${skill.status === 'enabled' ? '停用' : '启用'}
-                        </button>
-                    </td>
+                    <td><span class="readonly-note">通过 /skill 对话管理</span></td>
                 </tr>
             `).join('');
         }
 
+        return skills;
+
     } catch (error) {
         el.skillsList.innerHTML = '<tr><td colspan="5" class="empty">Skill 目录加载失败</td></tr>';
         showToast(error.message || 'Skill 目录加载失败', 'error');
+        return [];
     }
 }
 
-function renderSkillsSummary(skills) {
+async function loadSkillAudit() {
+    try {
+        const audits = await fetchJSON('/skills/audit?limit=20');
+        if (!audits.length) {
+            el.skillsAudit.innerHTML = '<div class="empty-state">暂无审计记录</div>';
+            return audits;
+        }
+
+        el.skillsAudit.innerHTML = audits.map(item => `
+            <div class="stack-item audit-item">
+                <div class="stack-item-head">
+                    <strong>${escapeHTML(item.entity_id || '-')}</strong>
+                    ${renderBadge(item.action || 'audit')}
+                </div>
+                <div class="stack-item-meta">
+                    <span>${escapeHTML(item.operator || '-')}</span>
+                    <span>${escapeHTML(formatTime(item.created_at))}</span>
+                </div>
+                <div class="table-muted">${escapeHTML(item.diff_summary || '-')}</div>
+            </div>
+        `).join('');
+        return audits;
+    } catch (error) {
+        el.skillsAudit.innerHTML = '<div class="empty-state">Skill 审计加载失败</div>';
+        showToast(error.message || 'Skill 审计加载失败', 'error');
+        return [];
+    }
+}
+
+async function loadSkillView() {
+    const [skills, audits] = await Promise.all([loadSkills(), loadSkillAudit()]);
+    renderSkillsSummary(skills, audits);
+}
+
+function renderSkillsSummary(skills, audits = []) {
     const enabled = skills.filter(skill => skill.status === 'enabled').length;
     const disabled = skills.filter(skill => skill.status === 'disabled').length;
     el.skillsSummary.innerHTML = [
         `目录总数 ${skills.length}`,
         `启用 ${enabled}`,
         `停用 ${disabled}`,
+        `最近审计 ${audits.length}`,
     ].map(renderSummaryPill).join('');
 }
 

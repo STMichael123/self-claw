@@ -177,20 +177,39 @@ class SessionManager:
             result.append(item)
         return result
 
-    def expire_stale_sessions(self) -> int:
-        """将超时的活跃会话标记为过期。返回处理数量。"""
+    def expire_stale_sessions(self, *, user_id: str | None = None) -> list[str]:
+        """将超时且非运行中的活跃会话标记为过期，返回被标记的 session_id 列表。"""
         cutoff = (datetime.now(timezone.utc) - self._timeout).isoformat()
         now = _utcnow()
-        cursor = self._db.execute(
-            """UPDATE sessions SET status = ?, expired_at = ?
-               WHERE status = ? AND last_active_at < ?""",
-            (SessionStatus.EXPIRED, now, SessionStatus.ACTIVE, cutoff),
+        query = """
+            SELECT s.id
+            FROM sessions s
+            WHERE s.status = ?
+              AND s.last_active_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_runs ar
+                  WHERE ar.id = s.current_run_id
+                    AND ar.status = ?
+              )
+        """
+        params: list[Any] = [SessionStatus.ACTIVE, cutoff, RunStatus.RUNNING.value]
+        if user_id:
+            query += " AND s.user_id = ?"
+            params.append(user_id)
+
+        rows = self._db.execute(query, params).fetchall()
+        session_ids = [row["id"] for row in rows]
+        if not session_ids:
+            return []
+
+        placeholders = ", ".join("?" for _ in session_ids)
+        self._db.execute(
+            f"UPDATE sessions SET status = ?, expired_at = ? WHERE id IN ({placeholders})",
+            (SessionStatus.EXPIRED, now, *session_ids),
         )
         self._db.commit()
-        count = cursor.rowcount
-        if count:
-            logger.info("sessions_expired", count=count)
-        return count
+        logger.info("sessions_expired", count=len(session_ids))
+        return session_ids
 
     def archive_session(self, session_id: str, *, summary: str = "") -> None:
         """归档会话（将摘要写入记录 + 导出 JSONL 归档文件）。"""
@@ -453,11 +472,34 @@ class SessionManager:
         每行: {role, content, timestamp, tool_calls?, metadata?}
         """
         rows = self._db.execute(
-            "SELECT role, content, created_at, metadata FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT role, content, created_at, metadata, run_id FROM messages WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,),
         ).fetchall()
         if not rows:
             return
+
+        run_ids = sorted({row["run_id"] for row in rows if row["run_id"]})
+        tool_call_map: dict[str, list[dict[str, Any]]] = {}
+        if run_ids:
+            placeholders = ", ".join("?" for _ in run_ids)
+            tool_rows = self._db.execute(
+                f"""
+                SELECT agent_run_id, tool_name, parameters, result, duration_ms, status, created_at
+                FROM tool_calls
+                WHERE agent_run_id IN ({placeholders})
+                ORDER BY created_at ASC
+                """,
+                run_ids,
+            ).fetchall()
+            for tool_row in tool_rows:
+                tool_call_map.setdefault(tool_row["agent_run_id"], []).append({
+                    "tool_name": tool_row["tool_name"],
+                    "parameters": _from_json(tool_row["parameters"], default={}),
+                    "result": tool_row["result"],
+                    "duration_ms": tool_row["duration_ms"],
+                    "status": tool_row["status"],
+                    "timestamp": tool_row["created_at"],
+                })
 
         self._archives_dir.mkdir(parents=True, exist_ok=True)
         archive_path = self._archives_dir / f"{session_id}.jsonl"
@@ -469,7 +511,9 @@ class SessionManager:
                     "content": row["content"],
                     "timestamp": row["created_at"],
                 }
-                metadata = _from_json(row.get("metadata"), default=None)
+                if row["run_id"] and tool_call_map.get(row["run_id"]):
+                    record["tool_calls"] = tool_call_map[row["run_id"]]
+                metadata = _from_json(row["metadata"], default=None)
                 if metadata:
                     record["metadata"] = metadata
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")

@@ -511,6 +511,14 @@ textarea {
     padding: 22px;
 }
 
+.panel-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 14px;
+}
+
 .chat-layout,
 .status-layout {
     display: grid;
@@ -772,6 +780,22 @@ select:focus {
 .task-card,
 .approval-card {
     cursor: default;
+}
+
+.audit-item {
+    cursor: default;
+}
+
+.audit-item:hover {
+    transform: none;
+}
+
+.readonly-note {
+    display: inline-flex;
+    align-items: center;
+    min-height: 32px;
+    color: var(--muted);
+    font-size: 13px;
 }
 
 .task-card:hover,

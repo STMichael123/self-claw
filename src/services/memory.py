@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
@@ -23,6 +24,7 @@ logger = structlog.get_logger()
 DOCUMENT_TIERS = {"principle", "long_term"}
 MEMORY_SCOPES = DOCUMENT_TIERS | {"short_term"}
 FORMAT_SUFFIX = {"markdown": ".md", "json": ".json"}
+LONG_TERM_KEY_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 class MemoryService:
@@ -63,6 +65,14 @@ class MemoryService:
         """写入 Principle 文件 + 重建索引 + 审计日志。"""
         self._principle_file.parent.mkdir(parents=True, exist_ok=True)
         self._principle_file.write_text(content, encoding="utf-8")
+        self._upsert_memory_document(
+            tier="principle",
+            key="principle",
+            title="Principle",
+            content=content,
+            source_type="manual",
+            source_ref=str(self._principle_file),
+        )
         self._upsert_memory_index(
             scope="principle",
             session_id=None,
@@ -89,6 +99,14 @@ class MemoryService:
         row = self._get_memory_index(scope="principle", ref_path=str(self._principle_file))
         if row and row.get("summary") == self._build_summary(content):
             return False
+        self._upsert_memory_document(
+            tier="principle",
+            key="principle",
+            title="Principle",
+            content=content,
+            source_type="manual",
+            source_ref=str(self._principle_file),
+        )
         self._upsert_memory_index(
             scope="principle",
             session_id=None,
@@ -103,7 +121,8 @@ class MemoryService:
 
     def load_long_term(self, key: str) -> str:
         """从文件读取指定 long-term 条目。"""
-        file_path = self._long_term_dir / f"{key}.md"
+        normalized_key = self._normalize_long_term_key(key)
+        file_path = self._long_term_dir / f"{normalized_key}.md"
         if not file_path.exists():
             return ""
         return file_path.read_text(encoding="utf-8")
@@ -136,11 +155,23 @@ class MemoryService:
         title: str = "",
         operator: str = "system",
         change_note: str = "",
+        source_type: str = "manual",
+        source_ref: str = "",
     ) -> Path:
         """写入 long-term 文件 + 重建索引。"""
+        normalized_key = self._normalize_long_term_key(key)
         self._long_term_dir.mkdir(parents=True, exist_ok=True)
-        file_path = self._long_term_dir / f"{key}.md"
+        file_path = self._long_term_dir / f"{normalized_key}.md"
         file_path.write_text(content, encoding="utf-8")
+        document_title = title.strip() or self._extract_title(content) or normalized_key
+        self._upsert_memory_document(
+            tier="long_term",
+            key=normalized_key,
+            title=document_title,
+            content=content,
+            source_type=source_type,
+            source_ref=source_ref or str(file_path),
+        )
         self._upsert_memory_index(
             scope="long_term",
             session_id=None,
@@ -152,10 +183,10 @@ class MemoryService:
             operator=operator,
             action="update_long_term",
             entity_type="long_term",
-            entity_id=key,
-            diff_summary=change_note or f"Long-term memory '{key}' updated",
+            entity_id=normalized_key,
+            diff_summary=change_note or f"Long-term memory '{normalized_key}' updated",
         )
-        logger.info("long_term_saved", key=key, path=str(file_path))
+        logger.info("long_term_saved", key=normalized_key, path=str(file_path))
         return file_path
 
     def sync_long_term_index(self) -> int:
@@ -172,6 +203,14 @@ class MemoryService:
             row = self._get_memory_index(scope="long_term", ref_path=str(fp))
             if row and row.get("summary") == summary:
                 continue
+            self._upsert_memory_document(
+                tier="long_term",
+                key=fp.stem,
+                title=self._extract_title(content) or fp.stem,
+                content=content,
+                source_type="manual",
+                source_ref=str(fp),
+            )
             self._upsert_memory_index(
                 scope="long_term",
                 session_id=None,
@@ -380,6 +419,48 @@ class MemoryService:
         )
         self._db.commit()
 
+    def _upsert_memory_document(
+        self,
+        *,
+        tier: str,
+        key: str,
+        title: str,
+        content: str,
+        source_type: str,
+        source_ref: str,
+    ) -> None:
+        if self._db is None:
+            return
+        doc_id = hashlib.sha256(f"{tier}:{key}".encode("utf-8")).hexdigest()[:16]
+        now = self._utcnow()
+        self._db.execute(
+            """
+            INSERT INTO memory_documents (
+                id, tier, key, title, content, format, version, source_type, source_ref, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                content = excluded.content,
+                source_type = excluded.source_type,
+                source_ref = excluded.source_ref,
+                updated_at = excluded.updated_at
+            """,
+            (
+                doc_id,
+                tier,
+                key,
+                title,
+                content,
+                "markdown",
+                "v1",
+                source_type,
+                source_ref,
+                now,
+                now,
+            ),
+        )
+        self._db.commit()
+
     def _persist_vector_record(self, *, text: str, content_hash: str, source_type: str, source_id: str) -> bool:
         if self._db is None:
             return False
@@ -432,6 +513,12 @@ class MemoryService:
             }
             for row in rows
         ]
+
+    def _normalize_long_term_key(self, key: str) -> str:
+        normalized = key.strip()
+        if not normalized or not LONG_TERM_KEY_PATTERN.fullmatch(normalized):
+            raise ValueError("long-term memory key must be lowercase kebab-case")
+        return normalized
 
     def _build_summary(self, text: str, *, limit: int = 200) -> str:
         collapsed = " ".join(text.split())

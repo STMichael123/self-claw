@@ -14,10 +14,12 @@ from apscheduler.triggers.cron import CronTrigger
 import structlog
 
 from src.contracts.models import RunStatus, TaskStatus
-from src.services.agent_service import DEFAULT_WEB_USER_ID, AgentService
+from src.services.agent_service import AgentRateLimitError, DEFAULT_WEB_USER_ID, AgentService
 from src.services.scheduler import SchedulerService
 
 logger = structlog.get_logger()
+
+DEFAULT_TASK_QUEUE_RETRY_SEC = 1.0
 
 
 class TaskService:
@@ -27,6 +29,11 @@ class TaskService:
         self._db = db
         self.scheduler = scheduler
         self.agent_service = agent_service
+        self._task_queue_retry_sec = DEFAULT_TASK_QUEUE_RETRY_SEC
+        self._queued_tasks: asyncio.PriorityQueue[tuple[float, int, str]] = asyncio.PriorityQueue()
+        self._queued_task_ids: set[str] = set()
+        self._queue_sequence = 0
+        self._queue_worker: asyncio.Task[None] | None = None
 
     def bootstrap(self) -> None:
         rows = self._db.execute("SELECT * FROM tasks WHERE status IN (?, ?)", (TaskStatus.ACTIVE.value, TaskStatus.PAUSED.value)).fetchall()
@@ -47,6 +54,11 @@ class TaskService:
                         "error": str(exc),
                     },
                 )
+
+    def shutdown(self) -> None:
+        if self._queue_worker is not None:
+            self._queue_worker.cancel()
+            self._queue_worker = None
 
     def list_tasks(self, *, status: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM tasks WHERE 1=1"
@@ -263,6 +275,27 @@ class TaskService:
                     session_id=result.get("session_id") or task.get("session_id") or "-",
                     reply=result.get("reply", ""),
                 )
+        except AgentRateLimitError as exc:
+            retry_delay = max(exc.retry_after_sec, 0.0)
+            retry_at = _utcnow_after_seconds(retry_delay)
+            self._update_task(
+                task_id,
+                last_run_at=_utcnow(),
+                next_run_at=retry_at,
+                last_result={
+                    "status": RunStatus.QUEUED.value,
+                    "error": exc.message,
+                    "error_code": exc.code,
+                },
+            )
+            self._db.execute(
+                "UPDATE run_logs SET ended_at = ?, status = ?, error_category = ?, error_detail = ? WHERE id = ?",
+                (_utcnow(), RunStatus.QUEUED.value, "rate_limited", exc.message, run_log_id),
+            )
+            self._db.commit()
+            self._enqueue_task_retry(task_id, delay_sec=retry_delay)
+            logger.info("task_execution_queued", task_id=task_id, delay_sec=retry_delay)
+            return
         except Exception as exc:
             finished_at = _utcnow()
             task_fields = {
@@ -290,6 +323,35 @@ class TaskService:
                 reply=str(exc),
             )
             logger.error("task_execution_failed", task_id=task_id, error=str(exc))
+
+    def _enqueue_task_retry(self, task_id: str, *, delay_sec: float) -> None:
+        if task_id in self._queued_task_ids:
+            return
+        loop = asyncio.get_running_loop()
+        self._queue_sequence += 1
+        self._queued_task_ids.add(task_id)
+        self._queued_tasks.put_nowait((loop.time() + delay_sec, self._queue_sequence, task_id))
+        self._ensure_queue_worker()
+
+    def _ensure_queue_worker(self) -> None:
+        if self._queue_worker is None or self._queue_worker.done():
+            self._queue_worker = asyncio.create_task(self._process_queued_tasks())
+
+    async def _process_queued_tasks(self) -> None:
+        try:
+            while True:
+                available_at, _, task_id = await self._queued_tasks.get()
+                delay = available_at - asyncio.get_running_loop().time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._queued_task_ids.discard(task_id)
+                task = self.get_task(task_id)
+                if task is None or task.get("status") != TaskStatus.ACTIVE.value:
+                    continue
+                await self._execute_task(task_id)
+        except asyncio.CancelledError:
+            logger.info("task_queue_worker_cancelled")
+            raise
 
     def _schedule_task(self, task: dict[str, Any], *, commit: bool = True) -> None:
         if task["status"] == TaskStatus.CANCELLED.value:
@@ -435,6 +497,8 @@ def describe_task_status(task: dict[str, Any]) -> str:
     if pending:
         return f"{base}，等待工具审批"
     last_status = last_result.get("status")
+    if last_status == RunStatus.QUEUED.value:
+        return f"{base}，等待并发槽位"
     if last_status == RunStatus.CANCELLED.value:
         return f"{base}，最近一次运行已取消"
     if last_status == RunStatus.FAILED.value:
@@ -467,6 +531,10 @@ def _to_delta(amount: int, unit: str) -> timedelta:
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utcnow_after_seconds(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
 def _from_json(raw: str | None, *, default: Any) -> Any:

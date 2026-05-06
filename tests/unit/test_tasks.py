@@ -40,3 +40,7 @@ class TestTaskStatusDescription:
     def test_status_description_with_pending_approval(self) -> None:
         text = describe_task_status({"status": "active", "last_result": {"pending_approval": {"tool_name": "exec"}}})
         assert "等待工具审批" in text
+
+    def test_status_description_with_queued_result(self) -> None:
+        text = describe_task_status({"status": "active", "last_result": {"status": "queued"}})
+        assert "等待并发槽位" in text

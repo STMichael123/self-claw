@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+import uuid
+
 import pytest
 
 from src.storage.database import get_connection
@@ -16,8 +20,8 @@ def db():
 
 
 @pytest.fixture
-def session_mgr(db) -> SessionManager:
-    return SessionManager(db, timeout_min=1)
+def session_mgr(db, tmp_path) -> SessionManager:
+    return SessionManager(db, timeout_min=1, archives_dir=str(tmp_path / "archives"))
 
 
 class TestDatabase:
@@ -59,6 +63,38 @@ class TestSessionManager:
         session = session_mgr.get_session(sid)
         assert session["status"] == "archived"
         assert session["summary"] == "test summary"
+
+    def test_close_session_exports_jsonl_with_tool_calls(self, session_mgr: SessionManager, db, tmp_path) -> None:
+        sid = session_mgr.create_session("archive-user")
+        now = datetime.now(timezone.utc).isoformat()
+        run_id = str(uuid.uuid4())
+
+        db.execute(
+            """
+            INSERT INTO agent_runs (id, parent_run_id, agent_role, skill_id, activated_skills, session_id, task_ref, context_ref, result_ref, started_at, ended_at, status, steps_count)
+            VALUES (?, NULL, 'main', NULL, '[]', ?, '', '{}', '{}', ?, ?, 'success', 1)
+            """,
+            (run_id, sid, now, now),
+        )
+        db.execute(
+            """
+            INSERT INTO tool_calls (id, agent_run_id, tool_name, parameters, result, duration_ms, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), run_id, "web_search", '{"query":"alpha"}', "ok", 12, "success", now),
+        )
+        db.commit()
+
+        session_mgr.add_message(sid, "assistant", "已执行工具", run_id=run_id, metadata={"trace": "ok"})
+        session_mgr.close_session(sid, summary="archive summary")
+
+        archive_path = tmp_path / "archives" / f"{sid}.jsonl"
+        assert archive_path.exists()
+
+        records = [json.loads(line) for line in archive_path.read_text(encoding="utf-8").splitlines()]
+        assert records[0]["tool_calls"][0]["tool_name"] == "web_search"
+        assert records[0]["tool_calls"][0]["parameters"]["query"] == "alpha"
+        assert records[0]["metadata"]["trace"] == "ok"
 
     def test_list_sessions(self, session_mgr: SessionManager) -> None:
         session_mgr.create_session("u4")

@@ -266,6 +266,23 @@ def build_builtin_tools(
                 runtime_context["skill_tool_allowlist"] = sorted(merged_tools)
         return _to_json(payload)
 
+    async def save_skill(
+        skill_name: str,
+        content: str,
+        change_note: str = "",
+        runtime_context: dict[str, Any] | None = None,
+    ) -> str:
+        if skill_service is None:
+            raise ToolError(ErrorCode.TOOL_EXECUTION_FAILED, "skill service is not configured")
+        operator = str((runtime_context or {}).get("user_id") or "system")
+        payload = skill_service.save_skill(
+            skill_name,
+            content=content,
+            operator=operator,
+            change_note=change_note,
+        )
+        return _to_json(payload)
+
     tools = [
         ToolDescriptor(
             name="web_fetch",
@@ -387,6 +404,23 @@ def build_builtin_tools(
             returns={"type": "string"},
             category="builtin",
             handler=activate_skill,
+        ),
+        ToolDescriptor(
+            name="save_skill",
+            display_name="保存 Skill",
+            description="通过专用 Skill 服务创建或更新正式 Skill，并自动刷新 registry 与审计记录",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string", "description": "要创建或更新的 Skill 名称"},
+                    "content": {"type": "string", "description": "完整的 SKILL.md 内容"},
+                    "change_note": {"type": "string", "description": "本次变更说明", "default": ""},
+                },
+                "required": ["skill_name", "content"],
+            },
+            returns={"type": "string"},
+            category="builtin",
+            handler=save_skill,
         ),
     ]
 

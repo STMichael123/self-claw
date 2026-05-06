@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from src.contracts.errors import ErrorCode
+from src.services.skill_service import SkillService
 from src.skills.registry import SkillRegistry, SkillRegistryError
+from src.storage.database import get_connection
 
 
 def _write_skill(
@@ -96,3 +98,42 @@ class TestSkillRegistry:
                 "---\nname: another-name\ndescription: bad\nallowed-tools: []\nmetadata: {}\n---\n\n# bad\n",
             )
         assert exc_info.value.code == ErrorCode.SKILL_VALIDATION_FAILED
+
+
+class TestSkillServiceContract:
+    def test_save_skill_creates_file_catalog_and_audit(self, tmp_path: Path) -> None:
+        db = get_connection(str(tmp_path / "skills.db"))
+        service = SkillService(db, skill_root=tmp_path / ".agents" / "skills")
+
+        try:
+            payload = service.save_skill(
+                "created-skill",
+                content=(
+                    "---\n"
+                    "name: created-skill\n"
+                    "description: 契约测试 Skill\n"
+                    "allowed-tools:\n"
+                    "  - web_fetch\n"
+                    "metadata:\n"
+                    "  owner: contract-tests\n"
+                    "---\n\n"
+                    "# Created Skill\n\n按照契约测试执行。\n"
+                ),
+                operator="tester",
+                change_note="contract create",
+            )
+
+            saved_file = tmp_path / ".agents" / "skills" / "created-skill" / "SKILL.md"
+            assert saved_file.exists()
+            assert payload["skill_name"] == "created-skill"
+            assert payload["action"] == "skill_create"
+
+            detail = service.get_catalog_entry("created-skill")
+            assert detail is not None
+            assert detail["frontmatter"]["name"] == "created-skill"
+
+            audit = service.list_audit(skill_name="created-skill", limit=1)
+            assert audit[0]["action"] == "skill_create"
+            assert audit[0]["operator"] == "tester"
+        finally:
+            db.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from datetime import datetime, timezone
@@ -13,7 +14,9 @@ from fastapi.testclient import TestClient
 
 from src.app.main import create_app
 from src.models.llm import ChatMessage, LLMAdapter, LLMResponse, StreamChunk, ToolCallRequest
-from src.services.agent_service import AgentService
+from src.services.agent_service import AgentRateLimitError, AgentService
+from src.services.scheduler import SchedulerService
+from src.services.task_service import TaskService
 from src.storage.database import get_connection
 from src.tools.registry import ToolDescriptor
 
@@ -215,6 +218,164 @@ class BlockingLLM(LLMAdapter):
         yield StreamChunk(delta=response.content, finish_reason=response.finish_reason)
 
 
+class DelegateRouteLLM(LLMAdapter):
+    def __init__(self) -> None:
+        self._call_count = 0
+        self.model = "test-delegate-route"
+
+    async def chat(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        self._call_count += 1
+        if self._call_count == 1:
+            return LLMResponse(
+                content="DELEGATE",
+                input_tokens=2,
+                output_tokens=1,
+                model=self.model,
+                finish_reason="stop",
+            )
+        if self._call_count == 2:
+            return LLMResponse(
+                content="子 Agent 已完成分析",
+                input_tokens=3,
+                output_tokens=2,
+                model=self.model,
+                finish_reason="stop",
+            )
+        return LLMResponse(
+            content="主 Agent 最终回复",
+            input_tokens=4,
+            output_tokens=3,
+            model=self.model,
+            finish_reason="stop",
+        )
+
+    async def chat_stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[StreamChunk]:
+        response = await self.chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+        yield StreamChunk(delta=response.content, finish_reason=response.finish_reason)
+
+
+class AmbiguousRouteLLM(LLMAdapter):
+    def __init__(self) -> None:
+        self._call_count = 0
+        self.model = "test-ambiguous-route"
+
+    async def chat(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        self._call_count += 1
+        if self._call_count == 1:
+            return LLMResponse(
+                content="我不确定",
+                input_tokens=2,
+                output_tokens=2,
+                model=self.model,
+                finish_reason="stop",
+            )
+        if self._call_count == 2:
+            return LLMResponse(
+                content="子 Agent 通过规则回退被触发",
+                input_tokens=3,
+                output_tokens=2,
+                model=self.model,
+                finish_reason="stop",
+            )
+        return LLMResponse(
+            content="主 Agent 汇总回复",
+            input_tokens=4,
+            output_tokens=3,
+            model=self.model,
+            finish_reason="stop",
+        )
+
+    async def chat_stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[StreamChunk]:
+        response = await self.chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+        yield StreamChunk(delta=response.content, finish_reason=response.finish_reason)
+
+
+class CreateSkillLLM(LLMAdapter):
+    def __init__(self, skill_name: str, skill_content: str) -> None:
+        self._call_count = 0
+        self._skill_name = skill_name
+        self._skill_content = skill_content
+        self.model = "test-create-skill"
+
+    async def chat(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        self._call_count += 1
+        if self._call_count == 1:
+            return LLMResponse(
+                content="已根据要求生成 Skill，开始保存。",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="save-skill-1",
+                        name="save_skill",
+                        arguments=json.dumps(
+                            {
+                                "skill_name": self._skill_name,
+                                "content": self._skill_content,
+                                "change_note": "create via /skill",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                ],
+                input_tokens=5,
+                output_tokens=4,
+                model=self.model,
+                finish_reason="tool_calls",
+            )
+        return LLMResponse(
+            content="Skill 已创建并可立即使用。",
+            input_tokens=2,
+            output_tokens=3,
+            model=self.model,
+            finish_reason="stop",
+        )
+
+    async def chat_stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[StreamChunk]:
+        response = await self.chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+        yield StreamChunk(delta=response.content, finish_reason=response.finish_reason, tool_calls=response.tool_calls)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "test.db"))
@@ -304,13 +465,62 @@ class TestSkillsAPI:
         assert enabled.status_code == 200
         assert enabled.json()["status"] == "enabled"
 
+        audit = client.get("/api/v1/skills/audit", params={"skill_name": "toggle-skill"})
+        assert audit.status_code == 200
+        payload = audit.json()
+        assert [item["action"] for item in payload[:2]] == ["skill_enable", "skill_disable"]
+
+    def test_slash_skill_creates_skill_and_records_audit(self, client: TestClient, tmp_path) -> None:
+        create_skill_dir = tmp_path / ".agents" / "skills" / "create-skill"
+        create_skill_dir.mkdir(parents=True, exist_ok=True)
+        (create_skill_dir / "SKILL.md").write_text(
+            _skill_markdown("create-skill", "创建 Skill", allowed_tools=["save_skill"]),
+            encoding="utf-8",
+        )
+        client.post("/api/v1/skills/reload")
+
+        generated_content = _skill_markdown(
+            "generated-skill",
+            "自动生成的 Skill",
+            allowed_tools=["web_fetch"],
+            body="# Generated Skill\n\n按步骤执行生成流程。",
+        )
+        llm = CreateSkillLLM("generated-skill", generated_content)
+        client.app.state.agent_service.model_router.get_primary = lambda: llm  # type: ignore[method-assign]
+
+        chat = client.post(
+            "/api/v1/agent/chat",
+            json={
+                "message": "/skill 请帮我创建一个新的测试 Skill",
+                "task_mode": "new_task",
+                "stream": False,
+                "user_id": "web-user",
+            },
+        )
+
+        assert chat.status_code == 200
+        payload = chat.json()
+        assert payload["reply"] == "Skill 已创建并可立即使用。"
+
+        saved_path = tmp_path / ".agents" / "skills" / "generated-skill" / "SKILL.md"
+        assert saved_path.exists()
+        assert "自动生成的 Skill" in saved_path.read_text(encoding="utf-8")
+
+        detail = client.get("/api/v1/skills/generated-skill")
+        assert detail.status_code == 200
+        assert detail.json()["frontmatter"]["name"] == "generated-skill"
+
+        audit = client.get("/api/v1/skills/audit", params={"skill_name": "generated-skill"})
+        assert audit.status_code == 200
+        assert audit.json()[0]["action"] == "skill_create"
+
 
 class TestToolsAPI:
     def test_list_tools(self, client: TestClient) -> None:
         resp = client.get("/api/v1/tools")
         assert resp.status_code == 200
         names = {item["name"] for item in resp.json()}
-        assert {"web_fetch", "web_search", "list_dir", "read_file", "write_file", "patch_file", "activate_skill", "exec"}.issubset(names)
+        assert {"web_fetch", "web_search", "list_dir", "read_file", "write_file", "patch_file", "activate_skill", "save_skill", "exec"}.issubset(names)
 
     def test_memory_search_returns_recent_session_memory(self, client: TestClient) -> None:
         client.app.state.agent_service.model_router.get_primary = lambda: ImmediateReplyLLM()  # type: ignore[method-assign]
@@ -331,6 +541,20 @@ class TestToolsAPI:
         payload = result.json()
         assert "files" in payload
         assert payload["files"]
+
+
+class TestMemoryAPI:
+    def test_create_long_term_rejects_invalid_key(self, client: TestClient) -> None:
+        resp = client.post(
+            "/api/v1/memory/long-term",
+            json={
+                "key": "../escape",
+                "content": "bad",
+                "operator": "tester",
+            },
+        )
+
+        assert resp.status_code == 422
 
     def test_memory_search_can_scope_to_session(self, client: TestClient) -> None:
         client.app.state.agent_service.model_router.get_primary = lambda: ImmediateReplyLLM()  # type: ignore[method-assign]
@@ -460,6 +684,27 @@ class TestTasksAPI:
         assert cost_payload["task_id"] == payload["id"]
         assert cost_payload["call_count"] >= 1
 
+    def test_agent_chat_returns_rate_limited_error_code(self, client: TestClient) -> None:
+        service = client.app.state.agent_service
+
+        def raise_rate_limited(*, user_id: str) -> None:
+            raise AgentRateLimitError("当前用户已有 1 个主 Agent 并行运行中，请等待完成后再试")
+
+        service._ensure_main_run_capacity = raise_rate_limited  # type: ignore[method-assign]
+
+        resp = client.post(
+            "/api/v1/agent/chat",
+            json={
+                "message": "请开始工作",
+                "task_mode": "new_task",
+                "stream": False,
+                "user_id": "web-user",
+            },
+        )
+
+        assert resp.status_code == 429
+        assert resp.json()["error_code"] == "RATE_LIMITED"
+
     def test_create_task_rejects_invalid_schedule(self, client: TestClient) -> None:
         created = client.post(
             "/api/v1/tasks",
@@ -569,10 +814,13 @@ class TestAgentAndStatusAPI:
         assert "event: done" in body
 
     def test_chat_creates_run_and_status_views(self, client: TestClient) -> None:
+        llm = DelegateRouteLLM()
+        client.app.state.agent_service.model_router.get_primary = lambda: llm  # type: ignore[method-assign]
+
         chat = client.post(
             "/api/v1/agent/chat",
             json={
-                "message": "请分析这个任务并给出建议",
+                "message": "请先看一下这个任务并给出建议",
                 "task_mode": "new_task",
                 "stream": False,
                 "user_id": "web-user",
@@ -591,6 +839,7 @@ class TestAgentAndStatusAPI:
         assert run_payload["status"] == "success"
         assert "tool_calls" in run_payload
         assert "child_run_summary" in run_payload
+        assert run_payload["child_run_summary"]["total"] == 1
 
         entry = client.get("/api/v1/status/entry", params={"user_id": "web-user"})
         assert entry.status_code == 200
@@ -604,6 +853,7 @@ class TestAgentAndStatusAPI:
         assert session_tree.status_code == 200
         runs = session_tree.json()["runs"]
         assert any(item["agent_role"] == "main" for item in runs)
+        assert any(item["agent_role"] == "sub" for item in runs)
 
     def test_invalid_task_mode_is_rejected(self, client: TestClient) -> None:
         resp = client.post(
@@ -1041,5 +1291,130 @@ async def test_concurrent_rejected_run_does_not_persist_extra_user_message(tmp_p
 
         messages = service.sessions.list_messages(session_id)
         assert [item["content"] for item in messages] == ["first message", "阻塞回复"]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_main_run_capacity_is_scoped_per_user(tmp_path) -> None:
+    db = get_connection(str(tmp_path / "per-user-capacity.db"))
+    service = AgentService(db, max_parallel_main_runs=1)
+    llm = BlockingLLM()
+    service.model_router.get_primary = lambda: llm  # type: ignore[method-assign]
+
+    try:
+        user_a_1 = service.create_session(user_id="user-a", title="A1")
+        user_a_2 = service.create_session(user_id="user-a", title="A2")
+        user_b_1 = service.create_session(user_id="user-b", title="B1")
+
+        first_chat = asyncio.create_task(
+            service.chat(
+                session_id=user_a_1["session_id"],
+                message="first message",
+                task_mode="continue",
+                user_id="user-a",
+            )
+        )
+        await asyncio.wait_for(llm.started.wait(), timeout=1)
+
+        with pytest.raises(AgentRateLimitError):
+            await service.chat(
+                session_id=user_a_2["session_id"],
+                message="second message",
+                task_mode="continue",
+                user_id="user-a",
+            )
+
+        other_user_chat = asyncio.create_task(
+            service.chat(
+                session_id=user_b_1["session_id"],
+                message="other user message",
+                task_mode="continue",
+                user_id="user-b",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not other_user_chat.done()
+
+        llm.release.set()
+        await asyncio.wait_for(first_chat, timeout=1)
+        await asyncio.wait_for(other_user_chat, timeout=1)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_task_is_queued_and_retried(tmp_path) -> None:
+    db = get_connection(str(tmp_path / "queued-task.db"))
+    scheduler = SchedulerService()
+    scheduler.start()
+    service = AgentService(db, max_parallel_main_runs=1)
+    task_service = TaskService(db, scheduler=scheduler, agent_service=service)
+    llm = BlockingLLM()
+    service.model_router.get_primary = lambda: llm  # type: ignore[method-assign]
+    task_service._task_queue_retry_sec = 0.05
+
+    try:
+        blocking_session = service.create_session(user_id="web-user", title="Blocking")
+        first_chat = asyncio.create_task(
+            service.chat(
+                session_id=blocking_session["session_id"],
+                message="block",
+                task_mode="continue",
+                user_id="web-user",
+            )
+        )
+        await asyncio.wait_for(llm.started.wait(), timeout=1)
+
+        task = task_service.create_task(
+            title="Queued Task",
+            prompt="run later",
+            schedule_text="10分钟后",
+        )
+
+        await task_service._execute_task(task["id"])
+        queued = task_service.get_task(task["id"])
+        assert queued is not None
+        assert queued["last_result"]["status"] == "queued"
+        assert queued["last_result"]["error_code"] == "RATE_LIMITED"
+
+        llm.release.set()
+
+        detail = queued
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            refreshed = task_service.get_task(task["id"])
+            assert refreshed is not None
+            detail = refreshed
+            if refreshed.get("last_result", {}).get("reply"):
+                break
+
+        assert detail["last_result"]["reply"] == "阻塞回复"
+        assert detail["status"] == "completed"
+        await asyncio.wait_for(first_chat, timeout=1)
+    finally:
+        task_service.shutdown()
+        scheduler.shutdown()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_route_falls_back_to_rule_keywords(tmp_path) -> None:
+    db = get_connection(str(tmp_path / "sub-agent-fallback.db"))
+    service = AgentService(db)
+    llm = AmbiguousRouteLLM()
+    service.model_router.get_primary = lambda: llm  # type: ignore[method-assign]
+
+    try:
+        result = await service.chat(
+            message="请分析这个任务并给出建议",
+            task_mode="new_task",
+            user_id="web-user",
+        )
+
+        assert result["reply"] == "主 Agent 汇总回复"
+        run = service.get_run(result["run_id"])
+        assert run is not None
+        assert run["child_run_summary"]["total"] == 1
     finally:
         db.close()

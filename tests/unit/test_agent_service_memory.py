@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from src.services.agent_service import AgentService
@@ -49,9 +51,11 @@ class TestAgentServiceMemory:
             base_snapshot="摘要 A",
         )
 
-        assert "风控策略" in context
-        assert "alpha 只属于 session-a" in context
-        assert "alpha 只属于 session-b" not in context
+        assert "风控策略" in context["long_term_context"]
+        assert "摘要 A" in context["short_term_context"]
+        assert "alpha 只属于 session-a" in context["short_term_context"]
+        assert "alpha 只属于 session-b" not in context["short_term_context"]
+        assert "alpha 只属于 session-a" not in context["long_term_context"]
 
     def test_principle_loaded_as_full_text(self, agent_service: AgentService, memory_service: MemoryService) -> None:
         memory_service.save_principle("我是全局约束文档", operator="test")
@@ -74,3 +78,28 @@ class TestAgentServiceMemory:
         assert any(item.get("session_id") == "session-a" for item in payload["files"] if item.get("scope") == "short_term")
         assert not any(item.get("session_id") == "session-b" for item in payload["files"] if item.get("scope") == "short_term")
         assert all(item["metadata"].get("source_id") == "session-a" for item in payload["vectors"])
+
+    def test_status_entry_auto_archives_stale_sessions_and_persists_summary(
+        self,
+        agent_service: AgentService,
+        memory_service: MemoryService,
+        db,
+    ) -> None:
+        created = agent_service.create_session(user_id="archive-user", title="旧会话")
+        session_id = created["session_id"]
+        agent_service.sessions.add_message(session_id, "user", "这是需要归档的历史内容")
+
+        stale_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        db.execute(
+            "UPDATE sessions SET last_active_at = ?, status = ? WHERE id = ?",
+            (stale_at, "active", session_id),
+        )
+        db.commit()
+
+        entry = agent_service.status_entry(user_id="archive-user")
+
+        assert all(item["session_id"] != session_id for item in entry)
+        session = agent_service.sessions.get_session(session_id)
+        assert session is not None
+        assert session["status"] == "archived"
+        assert "这是需要归档的历史内容" in memory_service.load_long_term(f"session-{session_id}")

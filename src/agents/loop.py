@@ -58,6 +58,7 @@ class AgentLoop:
         resume_state: dict[str, Any] | None = None,
         approved_approval: dict[str, Any] | None = None,
         runtime_context: dict[str, Any] | None = None,
+        prefetched_response: LLMResponse | None = None,
     ) -> AgentResult:
         """执行完整的 ReAct 循环（阻塞模式）。"""
         run_id = run_id or str(uuid.uuid4())
@@ -96,10 +97,14 @@ class AgentLoop:
                     "run_id": run_id,
                 })
 
-                resp = await self._await_with_cancellation(
-                    self.llm.chat(current_messages, tools=tool_defs),
-                    run_id=run_id,
-                )
+                if prefetched_response is not None:
+                    resp = prefetched_response
+                    prefetched_response = None
+                else:
+                    resp = await self._await_with_cancellation(
+                        self.llm.chat(current_messages, tools=tool_defs),
+                        run_id=run_id,
+                    )
                 total_input += resp.input_tokens
                 total_output += resp.output_tokens
                 self._ensure_not_cancelled(run_id)

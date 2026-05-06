@@ -7,10 +7,10 @@ import json
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, field_validator
 
-from src.services.agent_service import DEFAULT_WEB_USER_ID, AgentService
+from src.services.agent_service import AgentRateLimitError, DEFAULT_WEB_USER_ID, AgentService
 from src.services.skill_service import SkillService
 
 router = APIRouter(prefix="/api/v1")
@@ -73,6 +73,19 @@ class CreateLongTermRequest(BaseModel):
     content: str
     title: str = ""
     operator: str = DEFAULT_WEB_USER_ID
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized != value or not normalized:
+            raise ValueError("key must be lowercase kebab-case")
+        parts = normalized.split("-")
+        if any(not part or not part.isascii() or not part.replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "").isalnum() for part in parts):
+            raise ValueError("key must be lowercase kebab-case")
+        if normalized.lower() != normalized or "_" in normalized:
+            raise ValueError("key must be lowercase kebab-case")
+        return normalized
 
 
 # ── 健康检查 ────────────────────────────────────────────
@@ -165,6 +178,16 @@ async def agent_chat(req: ChatRequest, request: Request):
                         event_callback=push_event,
                         parse_slash=req.parse_slash,
                     )
+                except AgentRateLimitError as exc:
+                    await queue.put({
+                        "event": "reply",
+                        "payload": {"content": f"请求失败：{exc.message}"},
+                    })
+                    await queue.put({
+                        "event": "done",
+                        "payload": {"error": True, "error_code": exc.code},
+                    })
+                    return
                 except ValueError as exc:
                     await queue.put({"event": "reply", "payload": {"content": f"请求失败：{str(exc)}"}})
                     await queue.put({"event": "done", "payload": {"error": True}})
@@ -221,6 +244,11 @@ async def agent_chat(req: ChatRequest, request: Request):
             requested_skill_name=req.requested_skill_name,
             task_id=req.task_id,
             parse_slash=req.parse_slash,
+        )
+    except AgentRateLimitError as exc:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": exc.message, "error_code": exc.code},
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -94,6 +94,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # 关闭资源
+    app.state.task_service.shutdown()
     app.state.scheduler_service.shutdown()
     db.close()
 

@@ -149,6 +149,40 @@ class SkillService:
             raise SkillRegistryError(ErrorCode.SKILL_DISABLED, f"skill disabled: {skill_name}")
         return self._registry.activate(skill_name, resource_paths=resource_paths).to_dict()
 
+    def save_skill(
+        self,
+        skill_name: str,
+        *,
+        content: str,
+        operator: str,
+        change_note: str = "",
+    ) -> dict[str, Any]:
+        parsed = self._registry.validate_skill_text(skill_name, content)
+        skill_dir = self._registry.root / skill_name
+        skill_file = skill_dir / "SKILL.md"
+        action = "skill_update" if skill_file.exists() else "skill_create"
+
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+        self._audit(
+            operator=operator,
+            action=action,
+            entity_type="skill",
+            entity_id=skill_name,
+            version=None,
+            diff_summary=change_note or parsed.description,
+        )
+        self._db.commit()
+        self.reload_catalog()
+
+        detail = self.get_catalog_entry(skill_name) or {"skill_name": skill_name}
+        detail.update({
+            "action": action,
+            "path": str(skill_file),
+        })
+        return detail
+
     def perform_action(
         self,
         skill_name: str,
